@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Color Recall Challenge</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Visual memory | color recall | perceptual scoring</p>
+        <h1>Color Recall Challenge</h1>
+      </div>
+      <button id="themeToggleBtn" class="ghost-btn" type="button" aria-label="Switch theme">Dark mode</button>
+    </header>
+
+    <main class="layout single">
+      <aside id="menuClassement" class="menu-classement hidden" aria-hidden="true">
+        <div class="classement-head">
+          <div class="classement-top">
+            <p class="eyebrow">Classement</p>
+            <button id="closeClassementBtn" class="classement-close-btn" type="button" aria-label="Close classement">X</button>
+          </div>
+          <div class="classement-filters" role="group" aria-label="Classement mode filter">
+            <button id="classementFilterSolo" class="classement-filter-btn is-active" type="button">Solo</button>
+            <button id="classementFilterDaily" class="classement-filter-btn" type="button">Daily</button>
+          </div>
+        </div>
+        <div class="classement-scroll">
+          <div id="menuLeaderboard" class="leaderboard"></div>
+        </div>
+      </aside>
+
+      <section class="panel main-panel">
+        <div id="statusBanner" class="status-banner">Choose the game details, then start the run.</div>
+
+        <div id="setupStage" class="stage">
+          <div class="section-head setup-head">
+            <div>
+              <p class="eyebrow">Color memory game</p>
+              <h2>Guess the color</h2>
+            </div>
+          </div>
+
+          <div class="setup-shell">
+            <label class="name-bar">
+              <input id="playerName" type="text" maxlength="20" placeholder="Your name" />
+            </label>
+
+            <div class="setup-toolbar">
+              <div class="mode-options" role="radiogroup" aria-label="Game mode">
+                <label class="mode-option">
+                  <input type="radio" name="mode" value="solo" checked />
+                  <span class="mode-icon single-icon" aria-hidden="true"></span>
+                  <span>Single</span>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="mode" value="challenge" />
+                  <span class="mode-icon group-icon" aria-hidden="true"></span>
+                  <span>Multi</span>
+                </label>
+                <label class="mode-option">
+                  <input type="radio" name="mode" value="daily" />
+                  <span class="mode-icon daily-icon" aria-hidden="true"></span>
+                  <span>Daily</span>
+                </label>
+              </div>
+
+              <label class="difficulty-pill" for="difficultyToggle">
+                <input id="difficultyToggle" type="checkbox" />
+                <span class="difficulty-pill-text"><strong id="difficultyLabel">Easy</strong></span>
+              </label>
+
+              <button id="startBtn" class="go-btn" type="button">Go</button>
+              <button id="soundToggleBtn" class="ghost-btn sound-toggle-btn" type="button" aria-pressed="true">Sound on</button>
+            </div>
+
+            <div class="setup-hidden-tools" hidden>
+              <input id="memorySeconds" type="hidden" value="5" />
+              <span id="memorySecondsValue" class="subvalue">5 sec</span>
+              <button id="createChallengeBtn" class="secondary-btn" type="button">Create challenge link</button>
+              <button id="copyChallengeBtn" class="ghost-btn" type="button" disabled>Copy link</button>
+            </div>
+
+            <button id="toggleClassementBtn" class="secondary-btn" type="button">Show classement</button>
+          </div>
+        </div>
+
+        <div id="memoryStage" class="stage hidden">
+          <div class="section-head spread">
+            <div>
+              <p class="eyebrow">Step 2</p>
+              <h2>Memorize this color</h2>
+            </div>
+            <div class="pill-row">
+              <div class="timer-pill">Color <strong id="roundCounter">1 / 5</strong></div>
+              <div class="timer-pill">Time left <strong id="memoryTimer">5s</strong></div>
+            </div>
+          </div>
+
+          <div class="memory-single-wrap">
+            <div id="memoryColorCard" class="memory-single"></div>
+          </div>
+        </div>
+
+        <div id="guessStage" class="stage hidden">
+          <div class="guess-layout">
+            <div id="guessBoard" class="guess-board">
+              <div id="guessControls" class="slider-stack">
+                <div class="vertical-slider hue-column">
+                  <input id="hueSlider" type="range" min="0" max="360" value="180" aria-label="Hue" />
+                  <span class="slider-caption">Hue <strong id="hValLabel">180</strong></span>
+                </div>
+                <div class="vertical-slider sat-column">
+                  <input id="satSlider" type="range" min="0" max="100" value="80" aria-label="Saturation" />
+                  <span class="slider-caption">Sat <strong id="sValLabel">80</strong></span>
+                </div>
+                <div class="vertical-slider bri-column">
+                  <input id="briSlider" type="range" min="0" max="100" value="90" aria-label="Brightness" />
+                  <span class="slider-caption">Bright <strong id="bValLabel">90</strong></span>
+                </div>
+              </div>
+
+              <div class="preview-panel">
+                <div id="guessPreview" class="preview-card">
+                  <div class="guess-board-top">
+                    <div class="guess-board-round"><strong id="guessRoundCounter">1 / 5</strong></div>
+                    <div class="guess-board-brand">Color Recall</div>
+                  </div>
+                </div>
+
+                <div id="guessActions" class="guess-actions">
+                  <div class="hsb-readout" aria-hidden="true">H <span id="hVal">180</span> | S <span id="sVal">80</span> | B <span id="bVal">90</span></div>
+                  <button id="submitGuessBtn" class="circle-btn submit-btn" type="button" aria-label="Validate this color"></button>
+                </div>
+              </div>
+            </div>
+
+            <div id="roundFeedback" class="round-feedback hidden">
+              <p id="roundFeedbackText" class="muted"></p>
+              <div id="feedbackSplitSwatch" class="split-swatch" role="img" aria-label="Original and guessed colors">
+                <div class="half original" id="feedbackTargetSwatch"></div>
+                <div class="half guess" id="feedbackGuessSwatch"></div>
+                <div class="score-overlay">
+                  <span>Score</span>
+                  <strong id="feedbackSplitScore">0.00</strong>
+                </div>
+              </div>
+              <button id="nextRoundBtn" class="circle-btn" type="button" aria-label="Next color"></button>
+            </div>
+          </div>
+        </div>
+
+        <div id="finalStage" class="stage hidden">
+          <div class="section-head spread final-head">
+            <div>
+              <p class="eyebrow">Final score</p>
+              <h2>Your result</h2>
+              <p id="finalSummary" class="muted"></p>
+              <p id="finalRankText" class="muted">Classement: calculating...</p>
+              <p id="scoreJoke" class="score-joke">A little color-led comedy lands here after your run.</p>
+            </div>
+            <div class="score-chip"><span>Total</span><strong id="runningScore">0.00 / 50</strong></div>
+          </div>
+
+          <div id="roundBreakdown" class="comparison-grid"></div>
+          <section id="resultAnalytics" class="analytics-grid" aria-label="Run analytics"></section>
+          <div id="finalLeaderboard" class="leaderboard final-leaderboard"></div>
+
+          <div class="action-row">
+            <button id="mainMenuBtn" class="secondary-btn">Go to main menu</button>
+            <button id="restartBtn" class="primary-btn">Replay</button>
+          </div>
+        </div>
+
+        <div class="board-sections">
+          <div class="board-section">
+            <p class="eyebrow">High scores</p>
+            <div id="leaderboard" class="leaderboard"></div>
+          </div>
+
+          <div class="board-section">
+            <p class="eyebrow">Challenge board</p>
+            <div id="challengeBoard" class="leaderboard"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
