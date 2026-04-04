@@ -172,7 +172,7 @@ body {
 
 .classement-filters {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -1166,6 +1166,34 @@ button:disabled {
     min-width: 96px;
   }
 
+  body.challenge-page .setup-toolbar {
+    width: 100%;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    align-items: center;
+    gap: 10px;
+  }
+
+  body.challenge-page .mode-options {
+    grid-column: 1 / -1;
+    justify-content: space-between;
+    width: 100%;
+    gap: 6px;
+  }
+
+  body.challenge-page .mode-option {
+    flex: 1 1 0;
+    min-width: 0;
+  }
+
+  body.challenge-page .difficulty-pill,
+  body.challenge-page .go-btn,
+  body.challenge-page .sound-toggle-btn {
+    width: 100%;
+    min-width: 0;
+    justify-content: center;
+  }
+
   .main-panel {
     width: min(100%, calc(100vw - 20px));
     height: auto;
@@ -1235,6 +1263,47 @@ button:disabled {
 
   .mode-options {
     gap: 8px;
+  }
+
+  body.challenge-page .setup-shell {
+    gap: 14px;
+  }
+
+  body.challenge-page .name-bar {
+    width: min(100%, 320px);
+  }
+
+  body.challenge-page .setup-toolbar {
+    width: min(100%, 340px);
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  body.challenge-page .mode-options {
+    grid-column: 1 / -1;
+    gap: 4px;
+  }
+
+  body.challenge-page .mode-option > span:last-child {
+    font-size: 0.58rem;
+  }
+
+  body.challenge-page .mode-icon {
+    width: 38px;
+    height: 38px;
+  }
+
+  body.challenge-page .difficulty-pill,
+  body.challenge-page .go-btn,
+  body.challenge-page .sound-toggle-btn {
+    width: 100%;
+    min-width: 0;
+    height: 40px;
+  }
+
+  body.challenge-page .sound-toggle-btn {
+    font-size: 0.68rem;
+    padding-inline: 6px;
   }
 
   .action-row button {

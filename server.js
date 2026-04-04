@@ -58,7 +58,8 @@ const GAME_SUBMIT_MAX_REQUESTS = Number(process.env.GAME_SUBMIT_MAX_REQUESTS || 
 let activePort = INITIAL_PORT;
 let db;
 const schemaState = {
-  hasCreatedAt: false
+  hasCreatedAt: false,
+  hasChallengeCode: false
 };
 
 const activeGameSessions = new Map();
@@ -276,6 +277,17 @@ function normalizeChallengeCode(rawCode) {
     throw createValidationError(
       'Invalid challengeCode format.',
       'challengeCode must be 6-120 chars with letters, digits, underscores, or hyphens.'
+    );
+  }
+  return value;
+}
+
+function normalizeRequiredChallengeCode(rawCode, label = 'challengeCode') {
+  const value = normalizeChallengeCode(rawCode);
+  if (!value) {
+    throw createValidationError(
+      `Missing ${label}.`,
+      `${label} is required for multiplayer challenge pages.`
     );
   }
   return value;
@@ -704,6 +716,13 @@ function validateGameStartPayload(payload) {
     );
   }
 
+  if (safeMode === 'challenge' && !challengeCode) {
+    throw createValidationError(
+      'Missing challengeCode for challenge mode.',
+      'challengeCode is required to bind the run to a dedicated multiplayer page.'
+    );
+  }
+
   return {
     mode: safeMode,
     difficulty: safeDifficulty,
@@ -901,6 +920,7 @@ async function ensureSchema() {
   const columns = await all('PRAGMA table_info(scores)');
   const columnNames = new Set(columns.map((column) => String(column.name || '').toLowerCase()));
   schemaState.hasCreatedAt = columnNames.has('created_at');
+  schemaState.hasChallengeCode = columnNames.has('challenge_code');
 
   if (!columnNames.has('mode')) {
     await run(`ALTER TABLE scores ADD COLUMN mode TEXT NOT NULL DEFAULT 'solo'`);
@@ -910,6 +930,10 @@ async function ensureSchema() {
   }
   if (!columnNames.has('time')) {
     await run(`ALTER TABLE scores ADD COLUMN time TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!columnNames.has('challenge_code')) {
+    await run(`ALTER TABLE scores ADD COLUMN challenge_code TEXT NOT NULL DEFAULT ''`);
+    schemaState.hasChallengeCode = true;
   }
 
   await run(`
@@ -969,6 +993,7 @@ async function ensureSchema() {
   `);
 
   await run(`CREATE INDEX IF NOT EXISTS idx_scores_rank ON scores(score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_scores_challenge ON scores(mode, challenge_code, score DESC, time ASC)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_daily_plays_date ON daily_plays(date_key)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_score_check_sessions_status ON score_check_sessions(status, started_at)`);
   await run(`CREATE INDEX IF NOT EXISTS idx_score_check_rounds_game ON score_check_rounds(game_id, round_no)`);
@@ -979,6 +1004,9 @@ async function ensureSchema() {
   await run(`UPDATE scores SET mode='solo' WHERE mode IS NULL OR trim(mode)=''`);
   await run(`UPDATE scores SET difficulty='easy' WHERE difficulty IS NULL OR trim(difficulty)=''`);
   await run(`UPDATE scores SET time = datetime('now') WHERE time IS NULL OR trim(time)=''`);
+  if (schemaState.hasChallengeCode) {
+    await run(`UPDATE scores SET challenge_code='' WHERE challenge_code IS NULL`);
+  }
 }
 
 async function cleanupDailyData(dateKey) {
@@ -1048,7 +1076,7 @@ async function readScores(limit) {
   const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
   const rows = await all(
     `
-      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time
+      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
       FROM scores
       ORDER BY score DESC, stored_time ASC
       LIMIT ?
@@ -1066,6 +1094,7 @@ async function readScores(limit) {
       difficulty: normalizeDifficulty(row.difficulty),
       score: Number.isFinite(rawScore) ? rawScore : 0,
       time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
+      challengeCode: normalizeMode(row.mode) === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
       rank: index + 1
     };
   });
@@ -1094,7 +1123,7 @@ async function readScoresFiltered(limit, { mode = '', difficulty = '' } = {}) {
   const filter = buildLeaderboardFilter(mode, difficulty);
   const rows = await all(
     `
-      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time
+      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
       FROM scores
       ${filter.whereClause}
       ORDER BY score DESC, stored_time ASC
@@ -1110,6 +1139,37 @@ async function readScoresFiltered(limit, { mode = '', difficulty = '' } = {}) {
     return {
       name: sanitizeStoredName(row.name),
       mode: normalizeMode(row.mode),
+      difficulty: normalizeDifficulty(row.difficulty),
+      score: Number.isFinite(rawScore) ? rawScore : 0,
+      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
+      challengeCode: normalizeMode(row.mode) === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
+      rank: index + 1
+    };
+  });
+}
+
+async function readChallengeScores(challengeCode, limit) {
+  const safeCode = normalizeRequiredChallengeCode(challengeCode, 'challengeCode');
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+
+  const rows = await all(
+    `
+      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time
+      FROM scores
+      WHERE mode = 'challenge' AND challenge_code = ?
+      ORDER BY score DESC, stored_time ASC
+      LIMIT ?
+    `,
+    [safeCode, safeLimit]
+  );
+
+  return rows.map((row, index) => {
+    const rawScore = Number(row.score);
+    const when = row.stored_time ? new Date(row.stored_time) : new Date();
+    return {
+      name: sanitizeStoredName(row.name),
+      mode: 'challenge',
+      challengeCode: safeCode,
       difficulty: normalizeDifficulty(row.difficulty),
       score: Number.isFinite(rawScore) ? rawScore : 0,
       time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
@@ -1160,11 +1220,15 @@ async function readLeaderboardSummary({ mode = '', difficulty = '' } = {}) {
   };
 }
 
-async function insertScore({ name, score, mode, difficulty, clientIp }) {
+async function insertScore({ name, score, mode, difficulty, clientIp, challengeCode = '' }) {
   const safeName = normalizeSafeName(name);
   const safeScore = normalizeSafeScore(score);
   const safeMode = normalizeSafeMode(mode);
   const safeDifficulty = normalizeSafeDifficulty(difficulty);
+  const normalizedChallengeCode = normalizeChallengeCode(challengeCode);
+  const safeChallengeCode = safeMode === 'challenge'
+    ? normalizeRequiredChallengeCode(normalizedChallengeCode, 'challengeCode')
+    : '';
   const savedAt = new Date();
   const safeTime = savedAt.toISOString();
 
@@ -1182,18 +1246,18 @@ async function insertScore({ name, score, mode, difficulty, clientIp }) {
   if (schemaState.hasCreatedAt) {
     await run(
       `
-        INSERT INTO scores (name, mode, difficulty, score, time, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO scores (name, mode, difficulty, score, time, challenge_code, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
       `,
-      [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeTime]
+      [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode, safeTime]
     );
   } else {
     await run(
       `
-        INSERT INTO scores (name, mode, difficulty, score, time)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO scores (name, mode, difficulty, score, time, challenge_code)
+        VALUES (?, ?, ?, ?, ?, ?)
       `,
-      [safeName, safeMode, safeDifficulty, safeScore, safeTime]
+      [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode]
     );
   }
 
@@ -1207,21 +1271,36 @@ async function insertScore({ name, score, mode, difficulty, clientIp }) {
     );
   }
 
-  const rankRow = await get(
-    `
-      SELECT COUNT(*) AS totalHigher
-      FROM scores
-      WHERE score > ?
-         OR (score = ? AND ${getStoredTimeExpr()} < ?)
-    `,
-    [safeScore, safeScore, safeTime]
-  );
+  const rankRow = safeMode === 'challenge'
+    ? await get(
+      `
+        SELECT COUNT(*) AS totalHigher
+        FROM scores
+        WHERE mode = 'challenge'
+          AND challenge_code = ?
+          AND (
+            score > ?
+            OR (score = ? AND ${getStoredTimeExpr()} < ?)
+          )
+      `,
+      [safeChallengeCode, safeScore, safeScore, safeTime]
+    )
+    : await get(
+      `
+        SELECT COUNT(*) AS totalHigher
+        FROM scores
+        WHERE score > ?
+           OR (score = ? AND ${getStoredTimeExpr()} < ?)
+      `,
+      [safeScore, safeScore, safeTime]
+    );
 
   const rank = (Number(rankRow?.totalHigher) || 0) + 1;
   return {
     name: safeName,
     mode: safeMode,
     difficulty: safeDifficulty,
+    challengeCode: safeChallengeCode,
     score: safeScore,
     time: safeTime,
     rank
@@ -1343,10 +1422,26 @@ async function readScoreCheckRounds(gameId) {
   );
 }
 
+app.get('/challenge/:challengeCode', (req, res, next) => {
+  const code = String(req.params.challengeCode || '').trim();
+  if (!CHALLENGE_CODE_REGEX.test(code)) {
+    next();
+    return;
+  }
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+
 app.get('/api/health', (_req, res) => {
   pruneExpiredGameSessions();
   res.json({
     ok: true,
+    apiVersion: 2,
+    scoringModel: 'ciede2000',
+    features: {
+      leaderboardV2: true,
+      checkpointGate: true,
+      challengeDedicatedPages: true
+    },
     host: HOST,
     port: activePort,
     dbType: 'sqlite',
@@ -1354,6 +1449,10 @@ app.get('/api/health', (_req, res) => {
     utcDay: getUtcDayKey(),
     activeGameSessions: activeGameSessions.size
   });
+});
+
+app.get('/favicon.ico', (_req, res) => {
+  res.status(204).end();
 });
 
 app.get('/api/whoami', (req, res) => {
@@ -1371,6 +1470,42 @@ app.get('/api/daily', async (req, res) => {
       'Failed to load daily challenge.',
       String(error?.message || error),
       'DAILY_STATUS_ERROR'
+    );
+  }
+});
+
+app.get('/api/challenges/:challengeCode/scores', async (req, res) => {
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
+  let challengeCode = '';
+
+  try {
+    challengeCode = normalizeRequiredChallengeCode(req.params.challengeCode, 'challengeCode');
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid challenge code.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const entries = await readChallengeScores(challengeCode, limit);
+    res.json({
+      challengeCode,
+      entries,
+      totalEntries: entries.length
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      500,
+      'Failed to read challenge leaderboard.',
+      String(error?.message || error),
+      'CHALLENGE_SCORES_READ_ERROR'
     );
   }
 });
@@ -1508,6 +1643,7 @@ app.post('/api/game/start', applyGameStartRateLimit, async (req, res) => {
       id: gameId,
       mode: safeInput.mode,
       difficulty: safeInput.difficulty,
+      challengeCode: safeInput.challengeCode || '',
       seed,
       targets: normalizedColors,
       clientIp,
@@ -1538,6 +1674,7 @@ app.post('/api/game/start', applyGameStartRateLimit, async (req, res) => {
       seed,
       mode: safeInput.mode,
       difficulty: safeInput.difficulty,
+      challengeCode: safeInput.challengeCode || '',
       startedAt: startedAtMs,
       expiresAt: expiresAtMs,
       roundCount: normalizedColors.length,
@@ -1763,7 +1900,8 @@ app.post('/api/game/submit', applyGameSubmitRateLimit, async (req, res) => {
       score: serverFinalScore,
       mode: session.mode,
       difficulty: session.difficulty,
-      clientIp
+      clientIp,
+      challengeCode: session.challengeCode || ''
     });
 
     session.submitted = true;

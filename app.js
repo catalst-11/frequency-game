@@ -12,6 +12,7 @@ const ui = {
   closeClassementBtn: $('closeClassementBtn'),
   classementFilterSolo: $('classementFilterSolo'),
   classementFilterDaily: $('classementFilterDaily'),
+  classementFilterChallenge: $('classementFilterChallenge'),
   startBtn: $('startBtn'),
   createChallengeBtn: $('createChallengeBtn'),
   copyChallengeBtn: $('copyChallengeBtn'),
@@ -67,6 +68,7 @@ const ID_COOKIE_KEY = 'color_recall_player_id';
 const IP_COOKIE_KEY = 'color_recall_last_ip';
 const COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365;
 const SOUND_PREF_KEY = 'color_recall_sound_pref';
+const CHALLENGE_CODE_REGEX = /^[A-Za-z0-9_-]{6,120}$/;
 
 function getCookie(name) {
   const prefix = `${encodeURIComponent(name)}=`;
@@ -272,6 +274,27 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 1800) {
   }
 }
 
+function applyServerCapabilities(healthPayload) {
+  const version = Number(healthPayload?.apiVersion);
+  const hasLeaderboardV2 = Boolean(healthPayload?.features?.leaderboardV2)
+    || (Number.isFinite(version) && version >= 2);
+
+  state.leaderboardEndpointSupported = hasLeaderboardV2;
+
+  const scoring = String(healthPayload?.scoringModel || '').trim().toLowerCase();
+  if (scoring === 'ciede2000') {
+    state.serverScoreModel = 'ciede2000';
+    return;
+  }
+  if (scoring === 'cie76') {
+    state.serverScoreModel = 'cie76';
+    return;
+  }
+
+  // Legacy backends do not advertise capabilities and still use CIE76.
+  state.serverScoreModel = hasLeaderboardV2 ? 'ciede2000' : 'cie76';
+}
+
 async function resolveApiBase(force = false) {
   if (!force && state.apiBase) return state.apiBase;
   if (!force && state.apiResolvePromise) return state.apiResolvePromise;
@@ -283,8 +306,24 @@ async function resolveApiBase(force = false) {
       try {
         const response = await fetchWithTimeout(apiUrl(base, '/api/health'), {}, 1300);
         if (!response.ok) continue;
+        if (state.apiBase && state.apiBase !== base) {
+          state.leaderboardEndpointSupported = null;
+          state.serverScoreModel = 'unknown';
+        }
+        let healthPayload = null;
+        try {
+          healthPayload = await response.json();
+        } catch {
+          healthPayload = null;
+        }
+        applyServerCapabilities(healthPayload);
         state.apiBase = base;
         state.apiRetryAfter = 0;
+        const activeChallengeCode = getChallengeCodeFromUrl();
+        if (activeChallengeCode) {
+          const difficulty = ui.difficultyToggle.checked ? 'hard' : 'easy';
+          refreshChallengeShareLink(activeChallengeCode, difficulty);
+        }
         return base;
       } catch {
         // Try next candidate.
@@ -352,7 +391,10 @@ const state = {
   dailyStatus: null,
   classementFilter: 'solo',
   latestBoard: [],
+  latestChallengeBoard: [],
   latestLeaderboardSummary: null,
+  leaderboardEndpointSupported: null,
+  serverScoreModel: 'unknown',
   apiBase: '',
   apiResolvePromise: null,
   apiRetryAfter: 0,
@@ -539,6 +581,14 @@ function degrees(radiansValue) {
   return (radiansValue * 180) / Math.PI;
 }
 
+function deltaE76(lab1, lab2) {
+  return Math.sqrt(
+    ((lab1.l - lab2.l) ** 2)
+    + ((lab1.a - lab2.a) ** 2)
+    + ((lab1.b - lab2.b) ** 2)
+  );
+}
+
 function deltaE2000(lab1, lab2) {
   const L1 = lab1.l;
   const a1 = lab1.a;
@@ -658,7 +708,21 @@ function renderLeaderRows(target, entries, emptyMessage, limit) {
   });
 }
 
+function isChallengeContextActive() {
+  if (getChallengeCodeFromUrl()) return true;
+  const selectedMode = getSelectedMode();
+  return selectedMode === 'challenge';
+}
+
 function getClassementEntries(board) {
+  if (state.classementFilter === 'challenge') {
+    if (Array.isArray(state.latestChallengeBoard) && state.latestChallengeBoard.length) {
+      return state.latestChallengeBoard;
+    }
+    if (!Array.isArray(board)) return [];
+    return board.filter((entry) => String(entry?.mode || '').toLowerCase() === 'challenge');
+  }
+
   if (!Array.isArray(board)) return [];
   if (state.classementFilter === 'daily') {
     return board.filter((entry) => String(entry?.mode || '').toLowerCase() === 'daily');
@@ -668,15 +732,25 @@ function getClassementEntries(board) {
 
 function renderMenuClassement(board = state.latestBoard) {
   const filtered = getClassementEntries(board);
-  const emptyMessage = state.classementFilter === 'daily' ? 'No daily scores yet.' : 'No solo scores yet.';
+  let emptyMessage = 'No solo scores yet.';
+  if (state.classementFilter === 'daily') {
+    emptyMessage = 'No daily scores yet.';
+  } else if (state.classementFilter === 'challenge') {
+    emptyMessage = 'No multiplayer score yet for this shared page.';
+  }
   renderLeaderRows(ui.menuLeaderboard, filtered, emptyMessage);
 }
 
 function setClassementFilter(filter) {
-  const nextFilter = filter === 'daily' ? 'daily' : 'solo';
+  const nextFilter = filter === 'daily'
+    ? 'daily'
+    : (filter === 'challenge' ? 'challenge' : 'solo');
   state.classementFilter = nextFilter;
   ui.classementFilterSolo.classList.toggle('is-active', nextFilter === 'solo');
   ui.classementFilterDaily.classList.toggle('is-active', nextFilter === 'daily');
+  if (ui.classementFilterChallenge) {
+    ui.classementFilterChallenge.classList.toggle('is-active', nextFilter === 'challenge');
+  }
   renderMenuClassement();
 }
 
@@ -704,15 +778,24 @@ function colorToLab(color) {
   return xyzToLab(rgbToXyz(hsvToRgb(color.h, color.s, color.v)));
 }
 
+function getActiveScoreModel() {
+  return state.serverScoreModel === 'ciede2000' ? 'ciede2000' : 'cie76';
+}
+
 function scoreGuess(target, guess) {
-  const dE = deltaE2000(colorToLab(target), colorToLab(guess));
+  const targetLab = colorToLab(target);
+  const guessLab = colorToLab(guess);
+  const model = getActiveScoreModel();
+  const dE = model === 'ciede2000'
+    ? deltaE2000(targetLab, guessLab)
+    : deltaE76(targetLab, guessLab);
   const base = 10 / (1 + Math.pow(dE / 38, 1.6));
   const hueDiff = hueDifference(target.h, guess.h);
   const vividness = (target.s + guess.s) / 200;
   const recovery = hueDiff <= 18 ? (1 - hueDiff / 18) * 1.15 * vividness : 0;
   const penalty = (hueDiff > 42 && vividness > 0.35) ? ((hueDiff - 42) / 138) * 2.2 * vividness : 0;
   const roundScore = clamp(base + recovery - penalty, 0, 10);
-  return { dE, roundScore };
+  return { dE, roundScore, model };
 }
 
 function average(values) {
@@ -929,8 +1012,23 @@ function setStatus(message) {
 
 function setClassementVisible(visible) {
   const shouldShow = Boolean(visible);
-  ui.menuClassement.classList.toggle('hidden', !shouldShow);
-  ui.menuClassement.setAttribute('aria-hidden', String(!shouldShow));
+  if (shouldShow && isChallengeContextActive()) {
+    setClassementFilter('challenge');
+  }
+  if (!shouldShow && ui.menuClassement.contains(document.activeElement)) {
+    ui.toggleClassementBtn.focus({ preventScroll: true });
+  }
+
+  if (shouldShow) {
+    ui.menuClassement.classList.remove('hidden');
+    ui.menuClassement.setAttribute('aria-hidden', 'false');
+    ui.menuClassement.removeAttribute('inert');
+  } else {
+    ui.menuClassement.setAttribute('inert', '');
+    ui.menuClassement.setAttribute('aria-hidden', 'true');
+    ui.menuClassement.classList.add('hidden');
+  }
+
   ui.layout.classList.toggle('classement-open', shouldShow);
   ui.toggleClassementBtn.textContent = shouldShow ? 'Hide classement' : 'Show classement';
 }
@@ -957,7 +1055,8 @@ function initTheme() {
 
 function initFromUrl() {
   const params = new URLSearchParams(location.search);
-  if (params.get('mode') === 'challenge' && params.get('seed')) {
+  const challengeCode = getChallengeCodeFromUrl();
+  if ((params.get('mode') === 'challenge' && params.get('seed')) || challengeCode) {
     modeRadios.forEach((radio) => {
       radio.checked = radio.value === 'challenge';
     });
@@ -965,13 +1064,122 @@ function initFromUrl() {
       ui.difficultyToggle.checked = params.get('difficulty') === 'hard';
       updateDifficultyText();
     }
+    if (challengeCode) {
+      const difficulty = ui.difficultyToggle.checked ? 'hard' : 'easy';
+      refreshChallengeShareLink(challengeCode, difficulty);
+      setClassementFilter('challenge');
+    }
     setStatus('Challenge detected. Start the game to play the same 5 colors.');
   }
 }
 
+function getChallengeCodeFromPath() {
+  const parts = String(window.location.pathname || '')
+    .split('/')
+    .map((part) => part.trim())
+    .filter(Boolean);
+  if (parts.length >= 2 && parts[0].toLowerCase() === 'challenge') {
+    let code = '';
+    try {
+      code = decodeURIComponent(parts[1] || '').trim();
+    } catch {
+      code = String(parts[1] || '').trim();
+    }
+    return CHALLENGE_CODE_REGEX.test(code) ? code : '';
+  }
+  return '';
+}
+
 function getChallengeCodeFromUrl() {
+  const pathCode = getChallengeCodeFromPath();
+  if (pathCode) return pathCode;
   const params = new URLSearchParams(location.search);
-  return String(params.get('seed') || '').trim();
+  const queryCode = String(params.get('seed') || '').trim();
+  return CHALLENGE_CODE_REGEX.test(queryCode) ? queryCode : '';
+}
+
+function generateChallengeCode() {
+  return `ch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isLoopbackHostname(hostname) {
+  const normalized = String(hostname || '').trim().toLowerCase();
+  return normalized === 'localhost'
+    || normalized === '127.0.0.1'
+    || normalized === '::1'
+    || normalized === '[::1]';
+}
+
+function getPreferredShareOrigin() {
+  let currentOrigin = window.location.origin;
+  try {
+    const current = new URL(window.location.href);
+    currentOrigin = current.origin;
+    if (!isLoopbackHostname(current.hostname)) {
+      return current.origin;
+    }
+  } catch {
+    // Fallback to window.location.origin.
+  }
+
+  const candidateBase = state.apiBase || getApiCandidates()[0] || '';
+  try {
+    const api = new URL(candidateBase);
+    if (!isLoopbackHostname(api.hostname)) {
+      return api.origin;
+    }
+  } catch {
+    // Ignore invalid API base candidate.
+  }
+
+  return currentOrigin;
+}
+
+function buildChallengePageUrl(challengeCode, difficulty, baseOrigin = window.location.origin) {
+  const safeCode = String(challengeCode || '').trim();
+  const safeDifficulty = String(difficulty || '').toLowerCase() === 'hard' ? 'hard' : 'easy';
+  const url = new URL(`/challenge/${encodeURIComponent(safeCode)}`, baseOrigin);
+  url.searchParams.set('mode', 'challenge');
+  url.searchParams.set('difficulty', safeDifficulty);
+  url.searchParams.delete('seed');
+  return url;
+}
+
+function refreshChallengeShareLink(challengeCode, difficulty) {
+  const safeCode = String(challengeCode || '').trim();
+  if (!safeCode) {
+    state.challengeLink = '';
+    ui.copyChallengeBtn.disabled = true;
+    return;
+  }
+  const shareUrl = buildChallengePageUrl(safeCode, difficulty, getPreferredShareOrigin());
+  state.challengeLink = shareUrl.toString();
+  ui.copyChallengeBtn.disabled = false;
+}
+
+function updateChallengePageClass() {
+  const onChallengePage = Boolean(getChallengeCodeFromPath());
+  document.body.classList.toggle('challenge-page', onChallengePage);
+}
+
+function syncChallengeUrl(challengeCode, difficulty) {
+  const localUrl = buildChallengePageUrl(challengeCode, difficulty, window.location.origin);
+  history.replaceState({}, '', localUrl.toString());
+  refreshChallengeShareLink(challengeCode, difficulty);
+  updateChallengePageClass();
+}
+
+function ensureChallengeCodeForStart() {
+  const existing = getChallengeCodeFromUrl();
+  if (existing) {
+    syncChallengeUrl(existing, state.difficulty);
+    return existing;
+  }
+
+  const created = generateChallengeCode();
+  syncChallengeUrl(created, state.difficulty);
+  setStatus('Multiplayer page created. Share this dedicated link with other players.');
+  return created;
 }
 
 async function startGame() {
@@ -986,14 +1194,16 @@ async function startGame() {
     setStatus('Game cannot start because API server is unavailable.');
     return;
   }
+  if (state.serverScoreModel === 'unknown') {
+    state.serverScoreModel = 'cie76';
+  }
 
   const startPayload = {
     mode: state.mode,
     difficulty: state.difficulty
   };
   if (state.mode === 'challenge') {
-    const challengeCode = getChallengeCodeFromUrl();
-    if (challengeCode) startPayload.challengeCode = challengeCode;
+    startPayload.challengeCode = ensureChallengeCodeForStart();
   }
 
   let startResponse;
@@ -1044,6 +1254,12 @@ async function startGame() {
   state.seed = String(startData?.seed || '');
   state.mode = String(startData?.mode || state.mode);
   state.difficulty = String(startData?.difficulty || state.difficulty) === 'hard' ? 'hard' : 'easy';
+  if (state.mode === 'challenge') {
+    const boundCode = String(startData?.challengeCode || startPayload.challengeCode || getChallengeCodeFromUrl() || '').trim();
+    if (boundCode) {
+      syncChallengeUrl(boundCode, state.difficulty);
+    }
+  }
   state.authoritativeScore = null;
   state.colors = serverColors.map((color) => ({ ...color }));
   state.memorySeconds = state.difficulty === 'hard' ? 2 : 5;
@@ -1184,11 +1400,11 @@ async function submitGuess() {
     playRoundRejectedSound();
     ui.submitGuessBtn.disabled = false;
     if (checkpoint.code === 'GAME_EXPIRED') {
-      setStatus('Run expired. Start a new game.');
+      returnToMainMenu('Run expired. Start a new game.');
       return;
     }
     if (checkpoint.code === 'GAME_BLOCKED' || checkpoint.code === 'SCORE_MISMATCH_ROUND') {
-      setStatus('Run blocked by server due to score mismatch.');
+      returnToMainMenu('Run blocked by server due to score mismatch. Start a fresh run.');
       return;
     }
     setStatus(checkpoint.error || 'Round could not be verified by server.');
@@ -1217,7 +1433,8 @@ async function submitGuess() {
   ui.feedbackTargetSwatch.style.background = hsvToCss(target.h, target.s, target.v);
   ui.feedbackGuessSwatch.style.background = hsvToCss(guess.h, guess.s, guess.v);
   ui.feedbackSplitScore.textContent = acceptedRoundScore.toFixed(2);
-  ui.roundFeedbackText.textContent = `Round ${round} score: ${acceptedRoundScore.toFixed(2)} / 10 (DeltaE ${result.dE.toFixed(2)}).`;
+  const scoreModelLabel = result.model === 'ciede2000' ? 'CIEDE2000' : 'CIE76';
+  ui.roundFeedbackText.textContent = `Round ${round} score: ${acceptedRoundScore.toFixed(2)} / 10 (DeltaE ${result.dE.toFixed(2)} ${scoreModelLabel}).`;
   ui.guessBoard.classList.add('hidden');
   ui.roundFeedback.classList.remove('hidden');
   ui.guessPreview.classList.add('hidden');
@@ -1285,9 +1502,6 @@ function finishRun() {
     } else {
       ui.scoreJoke.textContent = getScoreJoke(state.totalScore);
     }
-    if (state.mode === 'challenge') {
-      storeChallengeResult(Number.isFinite(serverScore) ? serverScore : state.totalScore);
-    }
     renderFinalClassement(result?.board, result?.rank);
     const totalEntries = Number(state.latestLeaderboardSummary?.totalEntries);
     renderResultAnalytics({
@@ -1301,7 +1515,7 @@ function finishRun() {
   setStatus('Finished. This page compares all 5 colors and shows the sum of the scores.');
 }
 
-function returnToMainMenu() {
+function returnToMainMenu(statusMessage = 'Choose the game details, then start the run.') {
   showOnly(ui.setupStage);
   ui.roundFeedback.classList.add('hidden');
   ui.guessBoard.classList.remove('hidden');
@@ -1317,22 +1531,72 @@ function returnToMainMenu() {
   ui.finalRankText.textContent = 'Classement: -';
   ui.finalLeaderboard.innerHTML = '';
   if (ui.resultAnalytics) ui.resultAnalytics.innerHTML = '';
-  setStatus('Choose the game details, then start the run.');
+  setStatus(statusMessage);
 }
 
-function storeChallengeResult(sourceScore = state.totalScore) {
-  const urlSeed = getChallengeCodeFromUrl();
-  const keySeed = urlSeed || state.seed;
-  const key = `color-recall-challenge-${keySeed}`;
-  const board = JSON.parse(localStorage.getItem(key) || '[]');
-  const safeScore = Number(sourceScore);
-  board.push({
-    name: getDisplayName(),
-    score: Number.isFinite(safeScore) ? Number(safeScore.toFixed(2)) : 0,
-    time: new Date().toISOString()
-  });
-  board.sort((a, b) => b.score - a.score);
-  localStorage.setItem(key, JSON.stringify(board.slice(0, 20)));
+async function refreshChallengeBoard(primaryBase) {
+  const challengeCode = getChallengeCodeFromUrl();
+  if (!challengeCode) {
+    state.latestChallengeBoard = [];
+    if (state.classementFilter === 'challenge') {
+      renderMenuClassement(state.latestBoard);
+    }
+    ui.challengeBoard.innerHTML = '<p class="muted">Create a multiplayer page to get a dedicated challenge classement.</p>';
+    return [];
+  }
+
+  if (!primaryBase) {
+    state.latestChallengeBoard = [];
+    if (state.classementFilter === 'challenge') {
+      renderMenuClassement(state.latestBoard);
+    }
+    ui.challengeBoard.innerHTML = '<p class="muted">Challenge classement unavailable: API server not found.</p>';
+    return [];
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      apiUrl(primaryBase, `/api/challenges/${encodeURIComponent(challengeCode)}/scores?limit=100`),
+      {
+        headers: {
+          'X-Cluster-Peers': getClusterPeerHeader()
+        }
+      }
+    );
+
+    if (!response.ok) {
+      ui.challengeBoard.innerHTML = '<p class="muted">This backend does not support dedicated challenge pages yet.</p>';
+      state.latestChallengeBoard = [];
+      if (state.classementFilter === 'challenge') {
+        renderMenuClassement(state.latestBoard);
+      }
+      return [];
+    }
+
+    const payload = await response.json();
+    const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+    state.latestChallengeBoard = entries;
+    ui.challengeBoard.innerHTML = entries.length ? '' : '<p class="muted">No score yet for this multiplayer page.</p>';
+    entries.forEach((entry, i) => {
+      const row = document.createElement('div');
+      row.className = 'leader-row';
+      const safeName = escapeHtml(entry?.name || 'Player');
+      const safeScore = Number(entry?.score);
+      row.innerHTML = `<div class="rank-badge">${i + 1}</div><div><strong>${safeName}</strong><div class="muted">Multiplayer page</div></div><strong>${(Number.isFinite(safeScore) ? safeScore : 0).toFixed(2)}</strong>`;
+      ui.challengeBoard.appendChild(row);
+    });
+    if (state.classementFilter === 'challenge') {
+      renderMenuClassement(state.latestBoard);
+    }
+    return entries;
+  } catch {
+    state.latestChallengeBoard = [];
+    if (state.classementFilter === 'challenge') {
+      renderMenuClassement(state.latestBoard);
+    }
+    ui.challengeBoard.innerHTML = '<p class="muted">Challenge classement unavailable right now.</p>';
+    return [];
+  }
 }
 
 async function refreshBoards() {
@@ -1341,17 +1605,24 @@ async function refreshBoards() {
   state.latestLeaderboardSummary = null;
   if (primaryBase) {
     try {
-      const response = await fetchWithTimeout(apiUrl(primaryBase, '/api/leaderboard?limit=100'), {
-        headers: {
-          'X-Cluster-Peers': getClusterPeerHeader()
+      if (state.leaderboardEndpointSupported === true) {
+        const response = await fetchWithTimeout(apiUrl(primaryBase, '/api/leaderboard?limit=100'), {
+          headers: {
+            'X-Cluster-Peers': getClusterPeerHeader()
+          }
+        });
+        if (response.ok) {
+          state.leaderboardEndpointSupported = true;
+          const payload = await response.json();
+          const rows = Array.isArray(payload?.entries) ? payload.entries : [];
+          board = mergeBoards([rows]);
+          state.latestLeaderboardSummary = payload?.summary || null;
+        } else if (response.status === 404) {
+          state.leaderboardEndpointSupported = false;
         }
-      });
-      if (response.ok) {
-        const payload = await response.json();
-        const rows = Array.isArray(payload?.entries) ? payload.entries : [];
-        board = mergeBoards([rows]);
-        state.latestLeaderboardSummary = payload?.summary || null;
-      } else {
+      }
+
+      if (!board.length) {
         const fallback = await fetchWithTimeout(apiUrl(primaryBase, '/api/scores?limit=100'), {
           headers: {
             'X-Cluster-Peers': getClusterPeerHeader()
@@ -1373,27 +1644,17 @@ async function refreshBoards() {
     }
   }
 
-  state.latestBoard = board;
-  renderLeaderRows(ui.leaderboard, board, 'No scores yet.', 10);
-  renderMenuClassement(board);
-
-  const activeSeed = new URLSearchParams(location.search).get('seed') || state.seed;
-  const challengeRows = activeSeed ? JSON.parse(localStorage.getItem(`color-recall-challenge-${activeSeed}`) || '[]') : [];
-  ui.challengeBoard.innerHTML = challengeRows.length ? '' : '<p class="muted">Open or create a challenge to compare scores.</p>';
-  challengeRows.forEach((entry, i) => {
-    const row = document.createElement('div');
-    row.className = 'leader-row';
-    const safeName = escapeHtml(entry?.name || 'Player');
-    const safeScore = Number(entry?.score);
-    row.innerHTML = `<div class="rank-badge">${i + 1}</div><div><strong>${safeName}</strong><div class="muted">Shared challenge</div></div><strong>${(Number.isFinite(safeScore) ? safeScore : 0).toFixed(2)}</strong>`;
-    ui.challengeBoard.appendChild(row);
-  });
+  const publicBoard = board.filter((entry) => String(entry?.mode || '').toLowerCase() !== 'challenge');
+  state.latestBoard = publicBoard;
+  renderLeaderRows(ui.leaderboard, publicBoard, 'No scores yet.', 10);
+  renderMenuClassement(publicBoard);
+  await refreshChallengeBoard(primaryBase);
 
   if (!primaryBase) {
     setStatus('API not found. Start the backend server on port 3000 or 3001, or open with ?api=http://192.168.1.32:3000');
   }
 
-  return board;
+  return publicBoard;
 }
 
 async function ensurePlayerNameForSave() {
@@ -1413,16 +1674,20 @@ async function ensurePlayerNameForSave() {
 }
 
 async function saveScoreToServer() {
+  const boardForCurrentMode = (board) => (
+    state.mode === 'challenge' ? state.latestChallengeBoard : board
+  );
+
   const name = await ensurePlayerNameForSave();
   if (!name) {
     const board = await refreshBoards();
-    return { board, rank: null, saved: false };
+    return { board: boardForCurrentMode(board), rank: null, saved: false };
   }
 
   if (!state.activeGameId) {
     setStatus('Score was not saved because no active server game session exists.');
     const board = await refreshBoards();
-    return { board, rank: null, saved: false };
+    return { board: boardForCurrentMode(board), rank: null, saved: false };
   }
 
   const payload = {
@@ -1434,7 +1699,7 @@ async function saveScoreToServer() {
   if (!primaryBase) {
     setStatus('Score was not saved. API server not found.');
     const board = await refreshBoards();
-    return { board, rank: null, saved: false };
+    return { board: boardForCurrentMode(board), rank: null, saved: false };
   }
 
   try {
@@ -1462,28 +1727,28 @@ async function saveScoreToServer() {
         setStatus(payloadError.error || 'Daily already played for this IP today.');
         await fetchDailyStatus(true);
         const board = await refreshBoards();
-        return { board, rank: null, saved: false };
+        return { board: boardForCurrentMode(board), rank: null, saved: false };
       }
       if (payloadError?.code === 'GAME_EXPIRED') {
         setStatus('Run expired before submit. Please start a new game.');
         const board = await refreshBoards();
-        return { board, rank: null, saved: false };
+        return { board: boardForCurrentMode(board), rank: null, saved: false };
       }
       if (payloadError?.code === 'GAME_ALREADY_SUBMITTED') {
         setStatus('This run was already submitted.');
         const board = await refreshBoards();
-        return { board, rank: null, saved: false };
+        return { board: boardForCurrentMode(board), rank: null, saved: false };
       }
       if (payloadError?.code === 'GAME_INCOMPLETE') {
         setStatus('Run is incomplete. Every round must be validated first.');
         const board = await refreshBoards();
-        return { board, rank: null, saved: false };
+        return { board: boardForCurrentMode(board), rank: null, saved: false };
       }
       if (payloadError?.code === 'SCORE_MISMATCH_FINAL' || payloadError?.code === 'GAME_BLOCKED') {
         playRoundRejectedSound();
         setStatus('Server blocked this run because scores do not match checkpoints.');
         const board = await refreshBoards();
-        return { board, rank: null, saved: false };
+        return { board: boardForCurrentMode(board), rank: null, saved: false };
       }
       playRoundRejectedSound();
       throw new Error(payloadError?.error || 'save failed');
@@ -1495,19 +1760,20 @@ async function saveScoreToServer() {
       await fetchDailyStatus(true);
     }
     const board = await refreshBoards();
+    const scopedBoard = boardForCurrentMode(board);
     const apiRank = Number(savedPayload?.rank);
     if (Number.isFinite(apiRank) && apiRank > 0) {
-      return { board, rank: apiRank, saved: true, savedEntry: savedPayload };
+      return { board: scopedBoard, rank: apiRank, saved: true, savedEntry: savedPayload };
     }
-    const rank = board.findIndex((entry) =>
+    const rank = scopedBoard.findIndex((entry) =>
       entry.name === name && Number(entry.score) === Number(savedPayload?.score)
     );
-    return { board, rank: rank >= 0 ? rank + 1 : null, saved: true, savedEntry: savedPayload };
+    return { board: scopedBoard, rank: rank >= 0 ? rank + 1 : null, saved: true, savedEntry: savedPayload };
   } catch {
     playRoundRejectedSound();
     setStatus('Score was not saved. Server is unavailable.');
     const board = await refreshBoards();
-    return { board, rank: null, saved: false };
+    return { board: boardForCurrentMode(board), rank: null, saved: false };
   }
 }
 
@@ -1540,14 +1806,16 @@ function renderFinalClassement(board, rank) {
 
 function createChallengeLink() {
   const difficulty = ui.difficultyToggle.checked ? 'hard' : 'easy';
-  const seed = `ch-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
-  const url = new URL(location.href);
-  url.searchParams.set('mode', 'challenge');
-  url.searchParams.set('seed', seed);
-  url.searchParams.set('difficulty', difficulty);
-  state.challengeLink = url.toString();
-  ui.copyChallengeBtn.disabled = false;
-  setStatus('Challenge link generated. Copy it and send it to friends.');
+  const code = generateChallengeCode();
+  const url = buildChallengePageUrl(code, difficulty);
+  modeRadios.forEach((radio) => {
+    radio.checked = radio.value === 'challenge';
+  });
+  history.replaceState({}, '', url.toString());
+  refreshChallengeShareLink(code, difficulty);
+  updateChallengePageClass();
+  refreshBoards();
+  setStatus('Multiplayer page created. Copy and share this dedicated link.');
 }
 
 function toggleMenuClassement() {
@@ -1559,6 +1827,9 @@ function toggleMenuClassement() {
 }
 
 async function copyChallenge() {
+  if (!state.challengeLink) {
+    createChallengeLink();
+  }
   if (!state.challengeLink) return;
   try {
     await navigator.clipboard.writeText(state.challengeLink);
@@ -1576,6 +1847,13 @@ ui.difficultyToggle.addEventListener('change', updateDifficultyText);
 modeRadios.forEach((radio) => radio.addEventListener('change', () => {
   if (radio.value === 'daily') {
     setStatus('Daily mode locks in one game per calendar day.');
+  } else if (radio.value === 'challenge' && radio.checked) {
+    setStatus('Challenge mode uses a dedicated multiplayer page with its own leaderboard.');
+    setClassementFilter('challenge');
+  } else if (radio.value === 'solo' && radio.checked) {
+    if (state.classementFilter === 'challenge') {
+      setClassementFilter('solo');
+    }
   }
 }));
 
@@ -1584,6 +1862,9 @@ ui.toggleClassementBtn.addEventListener('click', toggleMenuClassement);
 ui.closeClassementBtn.addEventListener('click', () => setClassementVisible(false));
 ui.classementFilterSolo.addEventListener('click', () => setClassementFilter('solo'));
 ui.classementFilterDaily.addEventListener('click', () => setClassementFilter('daily'));
+if (ui.classementFilterChallenge) {
+  ui.classementFilterChallenge.addEventListener('click', () => setClassementFilter('challenge'));
+}
 ui.submitGuessBtn.addEventListener('click', submitGuess);
 ui.nextRoundBtn.addEventListener('click', goNextRound);
 ui.restartBtn.addEventListener('click', startGame);
@@ -1596,11 +1877,12 @@ if (ui.soundToggleBtn) {
 }
 
 initFromUrl();
+updateChallengePageClass();
 loadIdentityFromCookies();
 loadSoundPreference();
 updateDifficultyText();
 initTheme();
-setClassementFilter('solo');
+setClassementFilter(isChallengeContextActive() ? 'challenge' : 'solo');
 refreshBoards();
 refreshIdentityIpCookie();
 fetchDailyStatus();
