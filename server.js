@@ -43,6 +43,20 @@ const GAME_ID_REGEX = /^[A-Za-z0-9-]{16,128}$/;
 const ROUND_SCORE_MIN = 0;
 const ROUND_SCORE_MAX = 10;
 
+const FREQUENCY_ROUND_COUNT = 5;
+const FREQUENCY_DIFFICULTY_CONFIG = {
+  easy: { min: 180, max: 1200, tolerance: 0.36 },
+  hard: { min: 70, max: 2600, tolerance: 0.22 }
+};
+const FREQUENCY_ABSOLUTE_MIN = 40;
+const FREQUENCY_ABSOLUTE_MAX = 4000;
+const FREQUENCY_START_ALLOWED_FIELDS = new Set(['mode', 'difficulty', 'challengeCode']);
+const FREQUENCY_START_REQUIRED_FIELDS = ['mode', 'difficulty'];
+const FREQUENCY_CHECKPOINT_ALLOWED_FIELDS = new Set(['gameId', 'round', 'guess', 'score']);
+const FREQUENCY_CHECKPOINT_REQUIRED_FIELDS = ['gameId', 'round', 'guess', 'score'];
+const FREQUENCY_SUBMIT_ALLOWED_FIELDS = new Set(['gameId', 'name']);
+const FREQUENCY_SUBMIT_REQUIRED_FIELDS = ['gameId', 'name'];
+
 const RAW_GAME_TTL_MS = Number(process.env.GAME_SESSION_TTL_MS || 10 * 60_000);
 const GAME_TTL_MS = Math.max(30_000, Math.min(60 * 60_000, RAW_GAME_TTL_MS));
 const GAME_EXPIRED_GRACE_MS = Math.max(60_000, Number(process.env.GAME_EXPIRED_GRACE_MS) || 5 * 60_000);
@@ -61,11 +75,20 @@ const schemaState = {
   hasCreatedAt: false,
   hasChallengeCode: false
 };
+const frequencySchemaState = {
+  hasCreatedAt: false,
+  hasChallengeCode: false
+};
 
 const activeGameSessions = new Map();
 const gameStartRateLimitStore = new Map();
 const gameCheckpointRateLimitStore = new Map();
 const gameSubmitRateLimitStore = new Map();
+
+const activeFrequencyGameSessions = new Map();
+const frequencyStartRateLimitStore = new Map();
+const frequencyCheckpointRateLimitStore = new Map();
+const frequencySubmitRateLimitStore = new Map();
 
 const configuredCorsOrigins = new Set(
   String(process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || '')
@@ -88,6 +111,22 @@ function isAllowedCorsOrigin(origin, req) {
   }
 
   // Secure default: allow only same-origin unless FRONTEND_ORIGIN(S) is configured.
+  try {
+    const originUrl = new URL(origin);
+    const reqUrl = new URL(sameOrigin);
+    const isLoopback = (host) => {
+      const value = String(host || '').toLowerCase();
+      return value === 'localhost' || value === '127.0.0.1' || value === '::1';
+    };
+
+    // Dev-friendly exception: allow localhost/127.0.0.1 cross-port calls.
+    if (isLoopback(originUrl.hostname) && isLoopback(reqUrl.hostname)) {
+      return true;
+    }
+  } catch {
+    // Ignore malformed origins and keep deny-by-default behavior.
+  }
+
   return false;
 }
 
@@ -259,6 +298,64 @@ function normalizeRoundNumber(rawRound) {
   return round;
 }
 
+function normalizeFrequencyRoundNumber(rawRound) {
+  const round = Number(rawRound);
+  if (!Number.isInteger(round) || round < 1 || round > FREQUENCY_ROUND_COUNT) {
+    throw createValidationError(
+      'Invalid round index.',
+      `round must be an integer between 1 and ${FREQUENCY_ROUND_COUNT}.`
+    );
+  }
+  return round;
+}
+
+function getFrequencyDifficultyConfig(difficulty) {
+  return String(difficulty || '').toLowerCase() === 'hard'
+    ? FREQUENCY_DIFFICULTY_CONFIG.hard
+    : FREQUENCY_DIFFICULTY_CONFIG.easy;
+}
+
+function normalizeFrequencyValue(rawFrequency, label = 'frequency') {
+  const value = Number(rawFrequency);
+  if (!Number.isFinite(value) || !Number.isInteger(value)) {
+    throw createValidationError(
+      `Invalid ${label}.`,
+      `${label} must be an integer.`
+    );
+  }
+  if (value < FREQUENCY_ABSOLUTE_MIN || value > FREQUENCY_ABSOLUTE_MAX) {
+    throw createValidationError(
+      `Invalid ${label}.`,
+      `${label} must be between ${FREQUENCY_ABSOLUTE_MIN} and ${FREQUENCY_ABSOLUTE_MAX} Hz.`
+    );
+  }
+  return value;
+}
+
+function normalizeStrictFrequencyGuess(rawGuess, round) {
+  assertObjectPayload(rawGuess, `guess #${round}`);
+  const keys = Object.keys(rawGuess);
+  const required = ['frequency'];
+  const allowed = new Set(required);
+  const missing = required.filter((field) => !keys.includes(field));
+  if (missing.length) {
+    throw createValidationError(
+      `Missing guess field(s) at round ${round}.`,
+      `Missing: ${missing.join(', ')}`
+    );
+  }
+  const unexpected = keys.filter((field) => !allowed.has(field));
+  if (unexpected.length) {
+    throw createValidationError(
+      `Unexpected guess field(s) at round ${round}.`,
+      `Unexpected: ${unexpected.join(', ')}`
+    );
+  }
+  return {
+    frequency: normalizeFrequencyValue(rawGuess.frequency, `guess #${round}.frequency`)
+  };
+}
+
 function normalizeSafeGameId(rawGameId) {
   const value = String(rawGameId || '').trim();
   if (!GAME_ID_REGEX.test(value)) {
@@ -395,6 +492,89 @@ function createSeededColors(seed, difficulty) {
     }
     return { h, s, v };
   });
+}
+
+function seededRandomFrequency(rand, min, max) {
+  const minLog = Math.log2(min);
+  const maxLog = Math.log2(max);
+  const randomLog = minLog + (rand() * (maxLog - minLog));
+  return Math.round(2 ** randomLog);
+}
+
+function createSeededFrequencies(seed, difficulty) {
+  const rand = mulberry32(hashSeed(`frequency|${seed}|${difficulty}`));
+  const config = getFrequencyDifficultyConfig(difficulty);
+  return Array.from({ length: FREQUENCY_ROUND_COUNT }, () => (
+    seededRandomFrequency(rand, config.min, config.max)
+  ));
+}
+
+function normalizeTargetFrequencies(rawFrequencies, label = 'frequencies') {
+  if (!Array.isArray(rawFrequencies) || rawFrequencies.length !== FREQUENCY_ROUND_COUNT) {
+    throw new Error(`${label} must contain exactly ${FREQUENCY_ROUND_COUNT} entries.`);
+  }
+  return rawFrequencies.map((value, index) => normalizeFrequencyValue(value, `${label}[${index}]`));
+}
+
+function createRandomDailyFrequenciesForDifficulty(difficulty) {
+  const config = getFrequencyDifficultyConfig(difficulty);
+  return Array.from({ length: FREQUENCY_ROUND_COUNT }, () => (
+    seededRandomFrequency(Math.random, config.min, config.max)
+  ));
+}
+
+function parseDailyFrequencies(rawValue) {
+  try {
+    const parsed = JSON.parse(String(rawValue || '[]'));
+    if (!Array.isArray(parsed)) return null;
+    const normalized = parsed
+      .map((value) => {
+        try {
+          return normalizeFrequencyValue(value);
+        } catch {
+          return null;
+        }
+      })
+      .filter((value) => Number.isInteger(value));
+    if (normalized.length !== FREQUENCY_ROUND_COUNT) return null;
+    return normalized;
+  } catch {
+    return null;
+  }
+}
+
+function serializeDailyFrequencies(frequencies) {
+  const normalized = Array.isArray(frequencies)
+    ? frequencies
+      .map((value) => {
+        try {
+          return normalizeFrequencyValue(value);
+        } catch {
+          return null;
+        }
+      })
+      .filter((value) => Number.isInteger(value))
+    : [];
+  return JSON.stringify(normalized.slice(0, FREQUENCY_ROUND_COUNT));
+}
+
+function createFrequencyServerSeed({ mode, difficulty, challengeCode }) {
+  if (mode === 'daily') {
+    const dateKey = getUtcDayKey();
+    const digest = createHash('sha256')
+      .update(`frequency|daily|${dateKey}|${difficulty}`)
+      .digest('hex');
+    return `frequency|daily|${dateKey}|${digest.slice(0, 16)}`;
+  }
+
+  if (mode === 'challenge' && challengeCode) {
+    const digest = createHash('sha256')
+      .update(`frequency|challenge|${difficulty}|${challengeCode}`)
+      .digest('hex');
+    return `frequency|challenge|${digest.slice(0, 24)}`;
+  }
+
+  return `frequency|${mode}|${randomBytes(16).toString('hex')}`;
 }
 
 function hsvToRgb(h, s, v) {
@@ -575,6 +755,23 @@ function computeRoundScore(target, guess) {
   };
 }
 
+function computeFrequencyRoundScore(targetFrequency, guessFrequency, difficulty) {
+  const config = getFrequencyDifficultyConfig(difficulty);
+  const errorHz = Math.abs(guessFrequency - targetFrequency);
+  const errorRatio = errorHz / Math.max(1, targetFrequency);
+  const errorPercent = errorRatio * 100;
+  const normalizedError = errorRatio / config.tolerance;
+  const normalized = clamp(1 - normalizedError, 0, 1);
+  const curved = normalized ** 0.82;
+  const roundScore = clamp(curved * 10, 0, 10);
+
+  return {
+    errorHz: roundTo(errorHz, 2),
+    errorPercent: roundTo(errorPercent, 2),
+    roundScore: roundTo(roundScore, 2)
+  };
+}
+
 function createGameId() {
   if (typeof randomUUID === 'function') {
     return randomUUID();
@@ -679,6 +876,30 @@ const applyGameSubmitRateLimit = createIpRateLimitMiddleware({
   code: 'GAME_SUBMIT_RATE_LIMITED'
 });
 
+const applyFrequencyStartRateLimit = createIpRateLimitMiddleware({
+  store: frequencyStartRateLimitStore,
+  windowMs: GAME_START_WINDOW_MS,
+  maxRequests: GAME_START_MAX_REQUESTS,
+  errorMessage: 'Too many frequency game start requests. Please wait and try again.',
+  code: 'FREQUENCY_START_RATE_LIMITED'
+});
+
+const applyFrequencyCheckpointRateLimit = createIpRateLimitMiddleware({
+  store: frequencyCheckpointRateLimitStore,
+  windowMs: GAME_CHECKPOINT_WINDOW_MS,
+  maxRequests: GAME_CHECKPOINT_MAX_REQUESTS,
+  errorMessage: 'Too many frequency checkpoint requests. Please wait and try again.',
+  code: 'FREQUENCY_CHECKPOINT_RATE_LIMITED'
+});
+
+const applyFrequencySubmitRateLimit = createIpRateLimitMiddleware({
+  store: frequencySubmitRateLimitStore,
+  windowMs: GAME_SUBMIT_WINDOW_MS,
+  maxRequests: GAME_SUBMIT_MAX_REQUESTS,
+  errorMessage: 'Too many frequency submit requests. Please wait and try again.',
+  code: 'FREQUENCY_SUBMIT_RATE_LIMITED'
+});
+
 function pruneExpiredGameSessions(nowMs = Date.now()) {
   for (const [gameId, session] of activeGameSessions) {
     if (nowMs >= (session.expiresAtMs + GAME_EXPIRED_GRACE_MS)) {
@@ -694,6 +915,24 @@ function pruneExpiredGameSessions(nowMs = Date.now()) {
   const toRemove = activeGameSessions.size - GAME_STORE_MAX_ACTIVE;
   for (let i = 0; i < toRemove; i += 1) {
     activeGameSessions.delete(ordered[i][0]);
+  }
+}
+
+function pruneExpiredFrequencyGameSessions(nowMs = Date.now()) {
+  for (const [gameId, session] of activeFrequencyGameSessions) {
+    if (nowMs >= (session.expiresAtMs + GAME_EXPIRED_GRACE_MS)) {
+      activeFrequencyGameSessions.delete(gameId);
+    }
+  }
+
+  if (activeFrequencyGameSessions.size <= GAME_STORE_MAX_ACTIVE) return;
+
+  const ordered = Array.from(activeFrequencyGameSessions.entries())
+    .sort((a, b) => a[1].startedAtMs - b[1].startedAtMs);
+
+  const toRemove = activeFrequencyGameSessions.size - GAME_STORE_MAX_ACTIVE;
+  for (let i = 0; i < toRemove; i += 1) {
+    activeFrequencyGameSessions.delete(ordered[i][0]);
   }
 }
 
@@ -768,6 +1007,70 @@ function validateGameCheckpointPayload(payload) {
   };
 }
 
+function validateFrequencyGameStartPayload(payload) {
+  assertObjectPayload(payload, 'frequency game start');
+  assertFieldPolicy(payload, {
+    allowedFields: FREQUENCY_START_ALLOWED_FIELDS,
+    requiredFields: FREQUENCY_START_REQUIRED_FIELDS,
+    payloadLabel: 'frequency game start'
+  });
+
+  const safeMode = normalizeSafeMode(payload.mode);
+  const safeDifficulty = normalizeSafeDifficulty(payload.difficulty);
+  const challengeCode = normalizeChallengeCode(payload.challengeCode);
+
+  if (safeMode !== 'challenge' && challengeCode) {
+    throw createValidationError(
+      'Invalid challengeCode usage.',
+      'challengeCode can only be provided when mode is challenge.'
+    );
+  }
+
+  return {
+    mode: safeMode,
+    difficulty: safeDifficulty,
+    challengeCode
+  };
+}
+
+function validateFrequencyGameSubmitPayload(payload) {
+  assertObjectPayload(payload, 'frequency game submit');
+  assertFieldPolicy(payload, {
+    allowedFields: FREQUENCY_SUBMIT_ALLOWED_FIELDS,
+    requiredFields: FREQUENCY_SUBMIT_REQUIRED_FIELDS,
+    payloadLabel: 'frequency game submit'
+  });
+
+  const gameId = normalizeSafeGameId(payload.gameId);
+  const name = normalizeSafeName(payload.name);
+
+  return {
+    gameId,
+    name
+  };
+}
+
+function validateFrequencyGameCheckpointPayload(payload) {
+  assertObjectPayload(payload, 'frequency game checkpoint');
+  assertFieldPolicy(payload, {
+    allowedFields: FREQUENCY_CHECKPOINT_ALLOWED_FIELDS,
+    requiredFields: FREQUENCY_CHECKPOINT_REQUIRED_FIELDS,
+    payloadLabel: 'frequency game checkpoint'
+  });
+
+  const gameId = normalizeSafeGameId(payload.gameId);
+  const round = normalizeFrequencyRoundNumber(payload.round);
+  const guess = normalizeStrictFrequencyGuess(payload.guess, round);
+  const score = normalizeSafeRoundScore(payload.score);
+
+  return {
+    gameId,
+    round,
+    guess,
+    score
+  };
+}
+
 function createRequestError(statusCode, error, detail, code) {
   const issue = new Error(error);
   issue.statusCode = statusCode;
@@ -820,6 +1123,56 @@ function requireActiveGameSession({ gameId, clientIp, nowMs }) {
       'Game session IP mismatch.',
       'This game session does not belong to the current client IP.',
       'GAME_IP_MISMATCH'
+    );
+  }
+
+  return session;
+}
+
+function requireActiveFrequencyGameSession({ gameId, clientIp, nowMs }) {
+  const session = activeFrequencyGameSessions.get(gameId);
+  if (!session) {
+    throw createRequestError(
+      404,
+      'Frequency game session not found.',
+      'gameId does not exist or already expired.',
+      'FREQUENCY_GAME_NOT_FOUND'
+    );
+  }
+
+  if (nowMs >= session.expiresAtMs) {
+    throw createRequestError(
+      410,
+      'Frequency game session expired.',
+      'Start a new game and submit again.',
+      'FREQUENCY_GAME_EXPIRED'
+    );
+  }
+
+  if (session.submitted) {
+    throw createRequestError(
+      409,
+      'Frequency game already submitted.',
+      'A gameId can be used only once.',
+      'FREQUENCY_GAME_ALREADY_SUBMITTED'
+    );
+  }
+
+  if (session.blocked) {
+    throw createRequestError(
+      409,
+      'Frequency game is blocked.',
+      String(session.blockedReason || 'Score mismatch detected.'),
+      'FREQUENCY_GAME_BLOCKED'
+    );
+  }
+
+  if (session.clientIp !== clientIp) {
+    throw createRequestError(
+      403,
+      'Frequency game IP mismatch.',
+      'This game session does not belong to the current client IP.',
+      'FREQUENCY_GAME_IP_MISMATCH'
     );
   }
 
@@ -1007,6 +1360,113 @@ async function ensureSchema() {
   if (schemaState.hasChallengeCode) {
     await run(`UPDATE scores SET challenge_code='' WHERE challenge_code IS NULL`);
   }
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS frequency_scores (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'solo',
+      difficulty TEXT NOT NULL DEFAULT 'easy',
+      score REAL NOT NULL,
+      time TEXT NOT NULL,
+      challenge_code TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL
+    )
+  `);
+
+  const frequencyColumns = await all('PRAGMA table_info(frequency_scores)');
+  const frequencyColumnNames = new Set(
+    frequencyColumns.map((column) => String(column.name || '').toLowerCase())
+  );
+  frequencySchemaState.hasCreatedAt = frequencyColumnNames.has('created_at');
+  frequencySchemaState.hasChallengeCode = frequencyColumnNames.has('challenge_code');
+
+  if (!frequencyColumnNames.has('mode')) {
+    await run(`ALTER TABLE frequency_scores ADD COLUMN mode TEXT NOT NULL DEFAULT 'solo'`);
+  }
+  if (!frequencyColumnNames.has('difficulty')) {
+    await run(`ALTER TABLE frequency_scores ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'easy'`);
+  }
+  if (!frequencyColumnNames.has('time')) {
+    await run(`ALTER TABLE frequency_scores ADD COLUMN time TEXT NOT NULL DEFAULT ''`);
+  }
+  if (!frequencyColumnNames.has('challenge_code')) {
+    await run(`ALTER TABLE frequency_scores ADD COLUMN challenge_code TEXT NOT NULL DEFAULT ''`);
+    frequencySchemaState.hasChallengeCode = true;
+  }
+  if (!frequencyColumnNames.has('created_at')) {
+    await run(`ALTER TABLE frequency_scores ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`);
+    frequencySchemaState.hasCreatedAt = true;
+  }
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS frequency_daily_challenges (
+      date_key TEXT PRIMARY KEY,
+      easy_freqs_json TEXT NOT NULL,
+      hard_freqs_json TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS frequency_daily_plays (
+      date_key TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      player_name TEXT NOT NULL,
+      score REAL NOT NULL,
+      played_at TEXT NOT NULL,
+      PRIMARY KEY(date_key, ip)
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS frequency_score_check_sessions (
+      game_id TEXT PRIMARY KEY,
+      mode TEXT NOT NULL,
+      difficulty TEXT NOT NULL,
+      seed TEXT NOT NULL,
+      ip TEXT NOT NULL,
+      started_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      expected_rounds INTEGER NOT NULL,
+      checkpoint_count INTEGER NOT NULL DEFAULT 0,
+      ui_round_total REAL NOT NULL DEFAULT 0,
+      server_round_total REAL NOT NULL DEFAULT 0,
+      ui_final_score REAL,
+      server_final_score REAL,
+      status TEXT NOT NULL DEFAULT 'active',
+      blocked_reason TEXT NOT NULL DEFAULT '',
+      submitted_at TEXT,
+      promoted_at TEXT
+    )
+  `);
+
+  await run(`
+    CREATE TABLE IF NOT EXISTS frequency_score_check_rounds (
+      game_id TEXT NOT NULL,
+      round_no INTEGER NOT NULL,
+      guess_frequency INTEGER NOT NULL,
+      client_score REAL NOT NULL,
+      server_score REAL NOT NULL,
+      error_hz REAL NOT NULL,
+      error_percent REAL NOT NULL,
+      checked_at TEXT NOT NULL,
+      PRIMARY KEY(game_id, round_no)
+    )
+  `);
+
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_rank ON frequency_scores(score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_mode ON frequency_scores(mode, difficulty, score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_challenge ON frequency_scores(mode, challenge_code, score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_daily_plays_date ON frequency_daily_plays(date_key)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_check_sessions_status ON frequency_score_check_sessions(status, started_at)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_check_rounds_game ON frequency_score_check_rounds(game_id, round_no)`);
+
+  await run(`UPDATE frequency_scores SET mode='solo' WHERE mode IS NULL OR trim(mode)=''`);
+  await run(`UPDATE frequency_scores SET difficulty='easy' WHERE difficulty IS NULL OR trim(difficulty)=''`);
+  await run(`UPDATE frequency_scores SET challenge_code='' WHERE challenge_code IS NULL`);
+  await run(`UPDATE frequency_scores SET time = datetime('now') WHERE time IS NULL OR trim(time)=''`);
+  await run(`UPDATE frequency_scores SET created_at = COALESCE(NULLIF(created_at, ''), time, datetime('now'))`);
 }
 
 async function cleanupDailyData(dateKey) {
@@ -1307,6 +1767,386 @@ async function insertScore({ name, score, mode, difficulty, clientIp, challengeC
   };
 }
 
+function getFrequencyStoredTimeExpr() {
+  return frequencySchemaState.hasCreatedAt
+    ? `COALESCE(NULLIF(time,''), created_at)`
+    : 'time';
+}
+
+async function cleanupFrequencyDailyData(dateKey) {
+  await run(`DELETE FROM frequency_daily_plays WHERE date_key <> ?`, [dateKey]);
+  await run(`DELETE FROM frequency_daily_challenges WHERE date_key <> ?`, [dateKey]);
+}
+
+async function ensureFrequencyDailyChallenge(dateKey) {
+  const row = await get(
+    `SELECT easy_freqs_json, hard_freqs_json FROM frequency_daily_challenges WHERE date_key = ?`,
+    [dateKey]
+  );
+
+  const easyParsed = parseDailyFrequencies(row?.easy_freqs_json);
+  const hardParsed = parseDailyFrequencies(row?.hard_freqs_json);
+  if (easyParsed && hardParsed) {
+    return { easy: easyParsed, hard: hardParsed };
+  }
+
+  const easyFrequencies = createRandomDailyFrequenciesForDifficulty('easy');
+  const hardFrequencies = createRandomDailyFrequenciesForDifficulty('hard');
+  const createdAt = new Date().toISOString();
+
+  await run(
+    `
+      INSERT INTO frequency_daily_challenges (date_key, easy_freqs_json, hard_freqs_json, created_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(date_key) DO UPDATE SET
+        easy_freqs_json=excluded.easy_freqs_json,
+        hard_freqs_json=excluded.hard_freqs_json,
+        created_at=excluded.created_at
+    `,
+    [
+      dateKey,
+      serializeDailyFrequencies(easyFrequencies),
+      serializeDailyFrequencies(hardFrequencies),
+      createdAt
+    ]
+  );
+
+  return {
+    easy: normalizeTargetFrequencies(easyFrequencies, 'daily.easy'),
+    hard: normalizeTargetFrequencies(hardFrequencies, 'daily.hard')
+  };
+}
+
+async function getFrequencyDailyStatus(ip, difficulty) {
+  const dateKey = getUtcDayKey();
+  const safeDifficulty = normalizeSafeDifficulty(difficulty);
+  await cleanupFrequencyDailyData(dateKey);
+  const daily = await ensureFrequencyDailyChallenge(dateKey);
+  const play = await get(
+    `SELECT player_name, score, played_at FROM frequency_daily_plays WHERE date_key = ? AND ip = ?`,
+    [dateKey, ip]
+  );
+
+  return {
+    dateKey,
+    difficulty: safeDifficulty,
+    frequencies: safeDifficulty === 'hard' ? daily.hard : daily.easy,
+    ip,
+    playedToday: Boolean(play),
+    canPlay: !play,
+    playedEntry: play ? {
+      name: sanitizeStoredName(play.player_name),
+      score: Number(play.score || 0),
+      playedAt: String(play.played_at || '')
+    } : null
+  };
+}
+
+async function readFrequencyScores(limit) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
+  const rows = await all(
+    `
+      SELECT name, mode, difficulty, score, ${getFrequencyStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
+      FROM frequency_scores
+      ORDER BY score DESC, stored_time ASC
+      LIMIT ?
+    `,
+    [safeLimit]
+  );
+
+  return rows.map((row, index) => {
+    const rawScore = Number(row.score);
+    const when = row.stored_time ? new Date(row.stored_time) : new Date();
+    const mode = normalizeMode(row.mode);
+    return {
+      name: sanitizeStoredName(row.name),
+      mode,
+      difficulty: normalizeDifficulty(row.difficulty),
+      score: Number.isFinite(rawScore) ? rawScore : 0,
+      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
+      challengeCode: mode === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
+      rank: index + 1
+    };
+  });
+}
+
+function buildFrequencyLeaderboardFilter(mode, difficulty) {
+  const conditions = [];
+  const params = [];
+  if (mode) {
+    conditions.push('mode = ?');
+    params.push(mode);
+  }
+  if (difficulty) {
+    conditions.push('difficulty = ?');
+    params.push(difficulty);
+  }
+
+  return {
+    whereClause: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '',
+    params
+  };
+}
+
+async function readFrequencyScoresFiltered(limit, { mode = '', difficulty = '' } = {}) {
+  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
+  const filter = buildFrequencyLeaderboardFilter(mode, difficulty);
+  const rows = await all(
+    `
+      SELECT name, mode, difficulty, score, ${getFrequencyStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
+      FROM frequency_scores
+      ${filter.whereClause}
+      ORDER BY score DESC, stored_time ASC
+      LIMIT ?
+    `,
+    [...filter.params, safeLimit]
+  );
+
+  return rows.map((row, index) => {
+    const rawScore = Number(row.score);
+    const when = row.stored_time ? new Date(row.stored_time) : new Date();
+    const modeValue = normalizeMode(row.mode);
+    return {
+      name: sanitizeStoredName(row.name),
+      mode: modeValue,
+      difficulty: normalizeDifficulty(row.difficulty),
+      score: Number.isFinite(rawScore) ? rawScore : 0,
+      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
+      challengeCode: modeValue === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
+      rank: index + 1
+    };
+  });
+}
+
+async function readFrequencyLeaderboardSummary({ mode = '', difficulty = '' } = {}) {
+  const filter = buildFrequencyLeaderboardFilter(mode, difficulty);
+  const summaryRow = await get(
+    `
+      SELECT
+        COUNT(*) AS total_entries,
+        COUNT(DISTINCT name) AS unique_players,
+        COALESCE(AVG(score), 0) AS average_score,
+        COALESCE(MAX(score), 0) AS top_score,
+        MIN(${getFrequencyStoredTimeExpr()}) AS first_score_at,
+        MAX(${getFrequencyStoredTimeExpr()}) AS last_score_at
+      FROM frequency_scores
+      ${filter.whereClause}
+    `,
+    filter.params
+  );
+
+  const modeRows = await all(
+    `
+      SELECT mode, COUNT(*) AS entry_count
+      FROM frequency_scores
+      ${filter.whereClause}
+      GROUP BY mode
+      ORDER BY entry_count DESC
+    `,
+    filter.params
+  );
+
+  return {
+    totalEntries: Number(summaryRow?.total_entries) || 0,
+    uniquePlayers: Number(summaryRow?.unique_players) || 0,
+    averageScore: roundTo(Number(summaryRow?.average_score) || 0, 2),
+    topScore: roundTo(Number(summaryRow?.top_score) || 0, 2),
+    firstScoreAt: summaryRow?.first_score_at ? String(summaryRow.first_score_at) : '',
+    lastScoreAt: summaryRow?.last_score_at ? String(summaryRow.last_score_at) : '',
+    byMode: modeRows.map((row) => ({
+      mode: normalizeMode(row.mode),
+      count: Number(row.entry_count) || 0
+    }))
+  };
+}
+
+async function insertFrequencyScore({ name, score, mode, difficulty, clientIp, challengeCode = '' }) {
+  const safeName = normalizeSafeName(name);
+  const safeScore = normalizeSafeScore(score);
+  const safeMode = normalizeSafeMode(mode);
+  const safeDifficulty = normalizeSafeDifficulty(difficulty);
+  const safeChallengeCode = safeMode === 'challenge'
+    ? normalizeChallengeCode(challengeCode)
+    : '';
+  const savedAt = new Date();
+  const safeTime = savedAt.toISOString();
+
+  if (safeMode === 'daily') {
+    const daily = await getFrequencyDailyStatus(clientIp, safeDifficulty);
+    if (!daily.canPlay) {
+      const error = new Error('Daily already played for this IP today.');
+      error.code = 'DAILY_ALREADY_PLAYED';
+      error.statusCode = 409;
+      error.detail = `date=${daily.dateKey} ip=${clientIp}`;
+      throw error;
+    }
+  }
+
+  await run(
+    `
+      INSERT INTO frequency_scores (name, mode, difficulty, score, time, challenge_code, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `,
+    [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode, safeTime]
+  );
+
+  if (safeMode === 'daily') {
+    await run(
+      `
+        INSERT INTO frequency_daily_plays (date_key, ip, player_name, score, played_at)
+        VALUES (?, ?, ?, ?, ?)
+      `,
+      [getUtcDayKey(savedAt), clientIp, safeName, safeScore, safeTime]
+    );
+  }
+
+  const rankRow = safeMode === 'challenge'
+    ? await get(
+      `
+        SELECT COUNT(*) AS totalHigher
+        FROM frequency_scores
+        WHERE mode = 'challenge'
+          AND challenge_code = ?
+          AND (
+            score > ?
+            OR (score = ? AND ${getFrequencyStoredTimeExpr()} < ?)
+          )
+      `,
+      [safeChallengeCode, safeScore, safeScore, safeTime]
+    )
+    : await get(
+      `
+        SELECT COUNT(*) AS totalHigher
+        FROM frequency_scores
+        WHERE score > ?
+           OR (score = ? AND ${getFrequencyStoredTimeExpr()} < ?)
+      `,
+      [safeScore, safeScore, safeTime]
+    );
+
+  const rank = (Number(rankRow?.totalHigher) || 0) + 1;
+  return {
+    name: safeName,
+    mode: safeMode,
+    difficulty: safeDifficulty,
+    challengeCode: safeChallengeCode,
+    score: safeScore,
+    time: safeTime,
+    rank
+  };
+}
+
+async function createFrequencyScoreCheckSessionRecord({
+  gameId,
+  mode,
+  difficulty,
+  seed,
+  clientIp,
+  startedAtMs,
+  expiresAtMs,
+  expectedRounds
+}) {
+  await run(
+    `
+      INSERT INTO frequency_score_check_sessions (
+        game_id, mode, difficulty, seed, ip,
+        started_at, expires_at, expected_rounds,
+        checkpoint_count, ui_round_total, server_round_total,
+        status, blocked_reason
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', '')
+    `,
+    [
+      gameId,
+      mode,
+      difficulty,
+      seed,
+      clientIp,
+      new Date(startedAtMs).toISOString(),
+      new Date(expiresAtMs).toISOString(),
+      expectedRounds
+    ]
+  );
+}
+
+async function readFrequencyScoreCheckRoundSummary(gameId) {
+  const row = await get(
+    `
+      SELECT
+        COUNT(*) AS checkpoint_count,
+        COALESCE(SUM(client_score), 0) AS ui_round_total,
+        COALESCE(SUM(server_score), 0) AS server_round_total
+      FROM frequency_score_check_rounds
+      WHERE game_id = ?
+    `,
+    [gameId]
+  );
+
+  return {
+    checkpointCount: Number(row?.checkpoint_count) || 0,
+    uiRoundTotal: roundTo(Number(row?.ui_round_total) || 0, 2),
+    serverRoundTotal: roundTo(Number(row?.server_round_total) || 0, 2)
+  };
+}
+
+async function updateFrequencyScoreCheckSessionProgress(gameId) {
+  const summary = await readFrequencyScoreCheckRoundSummary(gameId);
+  await run(
+    `
+      UPDATE frequency_score_check_sessions
+      SET checkpoint_count = ?, ui_round_total = ?, server_round_total = ?
+      WHERE game_id = ?
+    `,
+    [summary.checkpointCount, summary.uiRoundTotal, summary.serverRoundTotal, gameId]
+  );
+  return summary;
+}
+
+async function markFrequencyScoreCheckSessionBlocked(gameId, reason) {
+  await run(
+    `
+      UPDATE frequency_score_check_sessions
+      SET status = 'blocked', blocked_reason = ?
+      WHERE game_id = ?
+    `,
+    [String(reason || 'Score mismatch detected.'), gameId]
+  );
+}
+
+async function markFrequencyScoreCheckSessionSubmitted(gameId, uiFinalScore, serverFinalScore, submittedAtIso) {
+  await run(
+    `
+      UPDATE frequency_score_check_sessions
+      SET ui_final_score = ?, server_final_score = ?, submitted_at = ?
+      WHERE game_id = ?
+    `,
+    [uiFinalScore, serverFinalScore, submittedAtIso, gameId]
+  );
+}
+
+async function markFrequencyScoreCheckSessionPromoted(gameId, promotedAtIso) {
+  await run(
+    `
+      UPDATE frequency_score_check_sessions
+      SET status = 'promoted', promoted_at = ?
+      WHERE game_id = ?
+    `,
+    [promotedAtIso, gameId]
+  );
+}
+
+async function readFrequencyScoreCheckRounds(gameId) {
+  return all(
+    `
+      SELECT round_no, server_score, error_hz, error_percent
+      FROM frequency_score_check_rounds
+      WHERE game_id = ?
+      ORDER BY round_no ASC
+    `,
+    [gameId]
+  );
+}
+
 function isSqliteUniqueConstraint(error) {
   return /UNIQUE constraint failed/i.test(String(error?.message || ''));
 }
@@ -1433,6 +2273,7 @@ app.get('/challenge/:challengeCode', (req, res, next) => {
 
 app.get('/api/health', (_req, res) => {
   pruneExpiredGameSessions();
+  pruneExpiredFrequencyGameSessions();
   res.json({
     ok: true,
     apiVersion: 2,
@@ -1440,14 +2281,16 @@ app.get('/api/health', (_req, res) => {
     features: {
       leaderboardV2: true,
       checkpointGate: true,
-      challengeDedicatedPages: true
+      challengeDedicatedPages: true,
+      frequencyGameV1: true
     },
     host: HOST,
     port: activePort,
     dbType: 'sqlite',
     dbPath: SQLITE_DB_PATH,
     utcDay: getUtcDayKey(),
-    activeGameSessions: activeGameSessions.size
+    activeGameSessions: activeGameSessions.size,
+    activeFrequencyGameSessions: activeFrequencyGameSessions.size
   });
 });
 
@@ -1936,6 +2779,492 @@ app.post('/api/game/submit', applyGameSubmitRateLimit, async (req, res) => {
       error?.code || 'GAME_SUBMIT_ERROR'
     );
   }
+});
+
+app.get('/api/frequency/daily', async (req, res) => {
+  let difficulty = 'easy';
+  try {
+    difficulty = normalizeSafeDifficulty(req.query.difficulty || 'easy');
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid daily query.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const status = await getFrequencyDailyStatus(getClientIp(req), difficulty);
+    res.json(status);
+  } catch (error) {
+    sendJsonError(
+      res,
+      500,
+      'Failed to load frequency daily challenge.',
+      String(error?.message || error),
+      'FREQUENCY_DAILY_STATUS_ERROR'
+    );
+  }
+});
+
+app.get('/api/frequency/scores', async (req, res) => {
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 10;
+  let modeFilter = '';
+  let difficultyFilter = '';
+
+  try {
+    modeFilter = normalizeOptionalMode(req.query.mode);
+    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency score query.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const rows = await readFrequencyScoresFiltered(limit, {
+      mode: modeFilter,
+      difficulty: difficultyFilter
+    });
+    res.json(rows);
+  } catch (error) {
+    sendJsonError(
+      res,
+      500,
+      'Failed to read frequency scores from SQLite.',
+      String(error?.message || error),
+      'FREQUENCY_SCORE_READ_ERROR'
+    );
+  }
+});
+
+app.get('/api/frequency/leaderboard', async (req, res) => {
+  const parsedLimit = Number(req.query.limit);
+  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
+  let modeFilter = '';
+  let difficultyFilter = '';
+
+  try {
+    modeFilter = normalizeOptionalMode(req.query.mode);
+    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency leaderboard query.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const [entries, summary] = await Promise.all([
+      readFrequencyScoresFiltered(limit, { mode: modeFilter, difficulty: difficultyFilter }),
+      readFrequencyLeaderboardSummary({ mode: modeFilter, difficulty: difficultyFilter })
+    ]);
+    res.json({
+      entries,
+      summary,
+      filters: {
+        mode: modeFilter || null,
+        difficulty: difficultyFilter || null
+      }
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      500,
+      'Failed to read frequency leaderboard summary.',
+      String(error?.message || error),
+      'FREQUENCY_LEADERBOARD_READ_ERROR'
+    );
+  }
+});
+
+app.post('/api/frequency/game/start', applyFrequencyStartRateLimit, async (req, res) => {
+  let safeInput;
+  try {
+    safeInput = validateFrequencyGameStartPayload(req.body);
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency game start payload.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  const nowMs = Date.now();
+  pruneExpiredFrequencyGameSessions(nowMs);
+
+  try {
+    let dailyFrequencies = null;
+    if (safeInput.mode === 'daily') {
+      const daily = await getFrequencyDailyStatus(clientIp, safeInput.difficulty);
+      if (!daily.canPlay) {
+        sendJsonError(
+          res,
+          409,
+          'Daily already played for this IP today.',
+          `date=${daily.dateKey} ip=${clientIp}`,
+          'DAILY_ALREADY_PLAYED'
+        );
+        return;
+      }
+      dailyFrequencies = daily.frequencies;
+    }
+
+    const seed = createFrequencyServerSeed({
+      mode: safeInput.mode,
+      difficulty: safeInput.difficulty,
+      challengeCode: safeInput.challengeCode
+    });
+    const targetFrequencies = safeInput.mode === 'daily'
+      ? normalizeTargetFrequencies(dailyFrequencies, 'daily.frequencies')
+      : normalizeTargetFrequencies(
+        createSeededFrequencies(seed, safeInput.difficulty),
+        'seeded.frequencies'
+      );
+    const gameId = createGameId();
+    const startedAtMs = nowMs;
+    const expiresAtMs = startedAtMs + GAME_TTL_MS;
+
+    activeFrequencyGameSessions.set(gameId, {
+      id: gameId,
+      mode: safeInput.mode,
+      difficulty: safeInput.difficulty,
+      challengeCode: safeInput.challengeCode || '',
+      seed,
+      targets: targetFrequencies,
+      clientIp,
+      startedAtMs,
+      expiresAtMs,
+      submitted: false,
+      blocked: false,
+      blockedReason: '',
+      checkpoints: [],
+      runningRawScore: 0,
+      runningScore: 0,
+      nextRound: 1
+    });
+
+    await createFrequencyScoreCheckSessionRecord({
+      gameId,
+      mode: safeInput.mode,
+      difficulty: safeInput.difficulty,
+      seed,
+      clientIp,
+      startedAtMs,
+      expiresAtMs,
+      expectedRounds: targetFrequencies.length
+    });
+
+    res.status(201).json({
+      gameId,
+      seed,
+      mode: safeInput.mode,
+      difficulty: safeInput.difficulty,
+      challengeCode: safeInput.challengeCode || '',
+      startedAt: startedAtMs,
+      expiresAt: expiresAtMs,
+      roundCount: targetFrequencies.length,
+      frequencies: targetFrequencies
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to start frequency game session.',
+      error?.detail || String(error?.message || error),
+      error?.code || 'FREQUENCY_GAME_START_ERROR'
+    );
+  }
+});
+
+app.post('/api/frequency/game/checkpoint', applyFrequencyCheckpointRateLimit, async (req, res) => {
+  let safeInput;
+  try {
+    safeInput = validateFrequencyGameCheckpointPayload(req.body);
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency game checkpoint payload.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  const nowMs = Date.now();
+  pruneExpiredFrequencyGameSessions(nowMs);
+
+  let session;
+  try {
+    session = requireActiveFrequencyGameSession({
+      gameId: safeInput.gameId,
+      clientIp,
+      nowMs
+    });
+  } catch (error) {
+    if (error?.code === 'FREQUENCY_GAME_EXPIRED') {
+      activeFrequencyGameSessions.delete(safeInput.gameId);
+    }
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency game session.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const expectedRound = session.nextRound;
+    if (safeInput.round !== expectedRound) {
+      throw createRequestError(
+        409,
+        'Round checkpoint out of order.',
+        `Expected round ${expectedRound} but received round ${safeInput.round}.`,
+        'FREQUENCY_ROUND_OUT_OF_ORDER'
+      );
+    }
+
+    const difficultyConfig = getFrequencyDifficultyConfig(session.difficulty);
+    if (
+      safeInput.guess.frequency < difficultyConfig.min
+      || safeInput.guess.frequency > difficultyConfig.max
+    ) {
+      throw createRequestError(
+        409,
+        'Guess out of range for this difficulty.',
+        `Expected ${difficultyConfig.min}-${difficultyConfig.max} Hz.`,
+        'FREQUENCY_GUESS_OUT_OF_RANGE'
+      );
+    }
+
+    const target = session.targets[safeInput.round - 1];
+    const computed = computeFrequencyRoundScore(target, safeInput.guess.frequency, session.difficulty);
+    const serverRoundScore = computed.roundScore;
+    const checkedAtIso = new Date(nowMs).toISOString();
+
+    try {
+      await run(
+        `
+          INSERT INTO frequency_score_check_rounds (
+            game_id, round_no, guess_frequency,
+            client_score, server_score, error_hz, error_percent, checked_at
+          )
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `,
+        [
+          session.id,
+          safeInput.round,
+          safeInput.guess.frequency,
+          safeInput.score,
+          serverRoundScore,
+          computed.errorHz,
+          computed.errorPercent,
+          checkedAtIso
+        ]
+      );
+    } catch (error) {
+      if (isSqliteUniqueConstraint(error)) {
+        throw createRequestError(
+          409,
+          'Round checkpoint already recorded.',
+          `Round ${safeInput.round} has already been checkpointed for this game.`,
+          'FREQUENCY_ROUND_ALREADY_CHECKPOINTED'
+        );
+      }
+      throw error;
+    }
+
+    const summary = await updateFrequencyScoreCheckSessionProgress(session.id);
+
+    if (safeInput.score !== serverRoundScore) {
+      session.blocked = true;
+      session.blockedReason = `Round ${safeInput.round} mismatch (client=${safeInput.score}, server=${serverRoundScore}).`;
+      await markFrequencyScoreCheckSessionBlocked(session.id, session.blockedReason);
+      throw createRequestError(
+        409,
+        'Round score mismatch detected.',
+        session.blockedReason,
+        'FREQUENCY_SCORE_MISMATCH_ROUND'
+      );
+    }
+
+    session.checkpoints.push({
+      round: safeInput.round,
+      guessFrequency: safeInput.guess.frequency,
+      clientScore: safeInput.score,
+      serverScore: serverRoundScore,
+      checkedAtMs: nowMs
+    });
+    session.runningRawScore = summary.serverRoundTotal;
+    session.runningScore = summary.serverRoundTotal;
+    session.nextRound = safeInput.round + 1;
+
+    res.status(201).json({
+      ok: true,
+      gameId: session.id,
+      round: safeInput.round,
+      acceptedScore: serverRoundScore,
+      runningScore: session.runningScore,
+      errorHz: computed.errorHz,
+      errorPercent: computed.errorPercent,
+      remainingRounds: Math.max(0, session.targets.length - summary.checkpointCount)
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to checkpoint frequency round.',
+      error?.detail || String(error?.message || error),
+      error?.code || 'FREQUENCY_GAME_CHECKPOINT_ERROR'
+    );
+  }
+});
+
+app.post('/api/frequency/game/submit', applyFrequencySubmitRateLimit, async (req, res) => {
+  let safeInput;
+  try {
+    safeInput = validateFrequencyGameSubmitPayload(req.body);
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency game submit payload.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  const clientIp = getClientIp(req);
+  const nowMs = Date.now();
+  pruneExpiredFrequencyGameSessions(nowMs);
+
+  let session;
+  try {
+    session = requireActiveFrequencyGameSession({
+      gameId: safeInput.gameId,
+      clientIp,
+      nowMs
+    });
+  } catch (error) {
+    if (error?.code === 'FREQUENCY_GAME_EXPIRED') {
+      activeFrequencyGameSessions.delete(safeInput.gameId);
+    }
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 400,
+      error?.message || 'Invalid frequency game session.',
+      error?.detail || '',
+      error?.code || null
+    );
+    return;
+  }
+
+  try {
+    const summary = await readFrequencyScoreCheckRoundSummary(session.id);
+    if (summary.checkpointCount !== session.targets.length) {
+      throw createRequestError(
+        409,
+        'Game is not complete.',
+        `Expected ${session.targets.length} checkpoint rounds but received ${summary.checkpointCount}.`,
+        'FREQUENCY_GAME_INCOMPLETE'
+      );
+    }
+
+    const serverFinalScore = summary.serverRoundTotal;
+    const submittedAtIso = new Date(nowMs).toISOString();
+    const stagedUiFinalScore = summary.uiRoundTotal;
+
+    await markFrequencyScoreCheckSessionSubmitted(
+      session.id,
+      stagedUiFinalScore,
+      serverFinalScore,
+      submittedAtIso
+    );
+
+    if (stagedUiFinalScore !== serverFinalScore) {
+      session.blocked = true;
+      session.blockedReason = `Final score mismatch (staged_ui=${stagedUiFinalScore}, server=${serverFinalScore}).`;
+      await markFrequencyScoreCheckSessionBlocked(session.id, session.blockedReason);
+      throw createRequestError(
+        409,
+        'Final score mismatch detected.',
+        session.blockedReason,
+        'FREQUENCY_SCORE_MISMATCH_FINAL'
+      );
+    }
+
+    const saved = await insertFrequencyScore({
+      name: safeInput.name,
+      score: serverFinalScore,
+      mode: session.mode,
+      difficulty: session.difficulty,
+      clientIp,
+      challengeCode: session.challengeCode || ''
+    });
+
+    session.submitted = true;
+    session.submittedAtMs = nowMs;
+    session.score = serverFinalScore;
+    session.runningRawScore = serverFinalScore;
+    session.runningScore = serverFinalScore;
+    await markFrequencyScoreCheckSessionPromoted(session.id, submittedAtIso);
+    const roundRows = await readFrequencyScoreCheckRounds(session.id);
+
+    res.status(201).json({
+      ...saved,
+      gameId: session.id,
+      startedAt: session.startedAtMs,
+      expiresAt: session.expiresAtMs,
+      submittedAt: nowMs,
+      roundCount: roundRows.length,
+      rounds: roundRows.map((round) => ({
+        round: Number(round.round_no),
+        score: Number(round.server_score),
+        errorHz: Number(round.error_hz),
+        errorPercent: Number(round.error_percent)
+      }))
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to submit frequency game result.',
+      error?.detail || String(error?.message || error),
+      error?.code || 'FREQUENCY_GAME_SUBMIT_ERROR'
+    );
+  }
+});
+
+app.post('/api/frequency/scores', (_req, res) => {
+  sendJsonError(
+    res,
+    410,
+    'Direct frequency score submission is disabled.',
+    'Use POST /api/frequency/game/start and POST /api/frequency/game/submit.',
+    'FREQUENCY_LEGACY_SCORE_ROUTE_DISABLED'
+  );
 });
 
 app.post('/api/scores', (_req, res) => {
