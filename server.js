@@ -1,17 +1,11 @@
-
 const path = require('path');
-const { createHash, randomBytes, randomUUID } = require('crypto');
+const { createHash, randomUUID, randomInt } = require('crypto');
 const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
-const {
-  createRandomDailyColors,
-  getUtcDayKey,
-  parseDailyColors,
-  serializeDailyColors
-} = require('./daily-service');
 
 const app = express();
 
+const VERSION = '2.0.0';
 const INITIAL_PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT_SCAN_LIMIT = Math.max(1, Number(process.env.PORT_SCAN_LIMIT) || 20);
@@ -22,1204 +16,43 @@ const SQLITE_DB_PATH = path.resolve(
   || path.join(__dirname, 'scores.db')
 );
 
-const SCORE_ALLOWED_MODES = new Set(['solo', 'challenge', 'daily']);
-const SCORE_ALLOWED_DIFFICULTIES = new Set(['easy', 'hard']);
-const PLAYER_NAME_REGEX = /^[A-Za-z0-9 _-]+$/;
-const PLAYER_NAME_MIN_LENGTH = 2;
-const PLAYER_NAME_MAX_LENGTH = 20;
-const SCORE_MIN = 0;
-const SCORE_MAX = 50;
-const SCORE_MAX_DECIMALS = 2;
-
-const GAME_ROUND_COUNT = 5;
-const GAME_START_ALLOWED_FIELDS = new Set(['mode', 'difficulty', 'challengeCode']);
-const GAME_START_REQUIRED_FIELDS = ['mode', 'difficulty'];
-const GAME_CHECKPOINT_ALLOWED_FIELDS = new Set(['gameId', 'round', 'guess', 'score']);
-const GAME_CHECKPOINT_REQUIRED_FIELDS = ['gameId', 'round', 'guess', 'score'];
-const GAME_SUBMIT_ALLOWED_FIELDS = new Set(['gameId', 'name']);
-const GAME_SUBMIT_REQUIRED_FIELDS = ['gameId', 'name'];
-const CHALLENGE_CODE_REGEX = /^[A-Za-z0-9_-]{6,120}$/;
-const GAME_ID_REGEX = /^[A-Za-z0-9-]{16,128}$/;
-const ROUND_SCORE_MIN = 0;
-const ROUND_SCORE_MAX = 10;
-
-const FREQUENCY_ROUND_COUNT = 5;
-const FREQUENCY_DIFFICULTY_CONFIG = {
+const ROUND_COUNT = 5;
+const ABSOLUTE_MIN_HZ = 40;
+const ABSOLUTE_MAX_HZ = 4000;
+const MODES = new Set(['solo', 'challenge', 'daily']);
+const DIFFICULTIES = new Set(['easy', 'hard']);
+const DIFFICULTY_CONFIG = {
   easy: { min: 180, max: 1200, tolerance: 0.36 },
   hard: { min: 70, max: 2600, tolerance: 0.22 }
 };
-const FREQUENCY_ABSOLUTE_MIN = 40;
-const FREQUENCY_ABSOLUTE_MAX = 4000;
-const FREQUENCY_START_ALLOWED_FIELDS = new Set(['mode', 'difficulty', 'challengeCode']);
-const FREQUENCY_START_REQUIRED_FIELDS = ['mode', 'difficulty'];
-const FREQUENCY_CHECKPOINT_ALLOWED_FIELDS = new Set(['gameId', 'round', 'guess', 'score']);
-const FREQUENCY_CHECKPOINT_REQUIRED_FIELDS = ['gameId', 'round', 'guess', 'score'];
-const FREQUENCY_SUBMIT_ALLOWED_FIELDS = new Set(['gameId', 'name']);
-const FREQUENCY_SUBMIT_REQUIRED_FIELDS = ['gameId', 'name'];
 
-const RAW_GAME_TTL_MS = Number(process.env.GAME_SESSION_TTL_MS || 10 * 60_000);
-const GAME_TTL_MS = Math.max(30_000, Math.min(60 * 60_000, RAW_GAME_TTL_MS));
-const GAME_EXPIRED_GRACE_MS = Math.max(60_000, Number(process.env.GAME_EXPIRED_GRACE_MS) || 5 * 60_000);
-const GAME_STORE_MAX_ACTIVE = Math.max(100, Number(process.env.GAME_STORE_MAX_ACTIVE) || 5000);
+const PLAYER_NAME_REGEX = /^[A-Za-z0-9 _-]+$/;
+const PLAYER_NAME_MIN_LENGTH = 2;
+const PLAYER_NAME_MAX_LENGTH = 20;
+const CHALLENGE_CODE_REGEX = /^[A-Za-z0-9_-]{3,120}$/;
+const GAME_ID_REGEX = /^[A-Za-z0-9-]{16,128}$/;
 
-const GAME_START_WINDOW_MS = Number(process.env.GAME_START_WINDOW_MS || 60_000);
-const GAME_START_MAX_REQUESTS = Number(process.env.GAME_START_MAX_REQUESTS || 20);
-const GAME_CHECKPOINT_WINDOW_MS = Number(process.env.GAME_CHECKPOINT_WINDOW_MS || 60_000);
-const GAME_CHECKPOINT_MAX_REQUESTS = Number(process.env.GAME_CHECKPOINT_MAX_REQUESTS || 60);
-const GAME_SUBMIT_WINDOW_MS = Number(process.env.GAME_SUBMIT_WINDOW_MS || 60_000);
-const GAME_SUBMIT_MAX_REQUESTS = Number(process.env.GAME_SUBMIT_MAX_REQUESTS || 30);
+const SESSION_TTL_MS = Math.max(60_000, Number(process.env.GAME_SESSION_TTL_MS) || 10 * 60_000);
+const MAX_ACTIVE_SESSIONS = Math.max(100, Number(process.env.GAME_STORE_MAX_ACTIVE) || 5000);
 
-let activePort = INITIAL_PORT;
-let db;
-const schemaState = {
-  hasCreatedAt: false,
-  hasChallengeCode: false
-};
-const frequencySchemaState = {
-  hasCreatedAt: false,
-  hasChallengeCode: false
-};
-
-const activeGameSessions = new Map();
-const gameStartRateLimitStore = new Map();
-const gameCheckpointRateLimitStore = new Map();
-const gameSubmitRateLimitStore = new Map();
-
-const activeFrequencyGameSessions = new Map();
-const frequencyStartRateLimitStore = new Map();
-const frequencyCheckpointRateLimitStore = new Map();
-const frequencySubmitRateLimitStore = new Map();
-
-const configuredCorsOrigins = new Set(
-  String(process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || '')
+const RAW_FRONTEND_ORIGINS = String(process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || '').trim();
+const FRONTEND_ORIGINS = new Set(
+  RAW_FRONTEND_ORIGINS
     .split(',')
-    .map((value) => value.trim())
+    .map((v) => v.trim())
     .filter(Boolean)
 );
 
-app.use(express.json({ limit: '10kb' }));
-app.use(express.static(__dirname));
+const db = new sqlite3.Database(SQLITE_DB_PATH);
+const gameSessions = new Map();
 
-function isAllowedCorsOrigin(origin, req) {
-  if (!origin) return true;
-
-  const sameOrigin = `${req.protocol}://${req.get('host')}`;
-  if (origin === sameOrigin) return true;
-
-  if (configuredCorsOrigins.size > 0) {
-    return configuredCorsOrigins.has(origin);
-  }
-
-  // Secure default: allow only same-origin unless FRONTEND_ORIGIN(S) is configured.
-  try {
-    const originUrl = new URL(origin);
-    const reqUrl = new URL(sameOrigin);
-    const isLoopback = (host) => {
-      const value = String(host || '').toLowerCase();
-      return value === 'localhost' || value === '127.0.0.1' || value === '::1';
-    };
-
-    // Dev-friendly exception: allow localhost/127.0.0.1 cross-port calls.
-    if (isLoopback(originUrl.hostname) && isLoopback(reqUrl.hostname)) {
-      return true;
-    }
-  } catch {
-    // Ignore malformed origins and keep deny-by-default behavior.
-  }
-
-  return false;
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
-function sendJsonError(res, statusCode, error, detail, code = null) {
-  res.status(statusCode).json({
-    error: String(error || 'Request failed'),
-    code: code || null,
-    detail: detail ? String(detail) : ''
-  });
-}
-
-function createValidationError(error, detail) {
-  const issue = new Error(error);
-  issue.statusCode = 400;
-  issue.code = 'VALIDATION_ERROR';
-  issue.detail = detail || '';
-  return issue;
-}
-
-function assertObjectPayload(payload, payloadLabel) {
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw createValidationError(
-      `Invalid ${payloadLabel} payload.`,
-      'Body must be a JSON object.'
-    );
-  }
-}
-
-function assertFieldPolicy(payload, { allowedFields, requiredFields, payloadLabel }) {
-  const keys = Object.keys(payload);
-  const missing = requiredFields.filter((field) => !keys.includes(field));
-  if (missing.length) {
-    throw createValidationError(
-      `Missing required field(s) in ${payloadLabel} payload.`,
-      `Required fields: ${requiredFields.join(', ')}. Missing: ${missing.join(', ')}`
-    );
-  }
-
-  const unexpected = keys.filter((field) => !allowedFields.has(field));
-  if (unexpected.length) {
-    throw createValidationError(
-      `Unexpected field(s) in ${payloadLabel} payload.`,
-      `Allowed fields: ${Array.from(allowedFields).join(', ')}. Unexpected: ${unexpected.join(', ')}`
-    );
-  }
-}
-
-function normalizeSafeName(rawName) {
-  const trimmed = String(rawName || '').trim();
-  if (trimmed.length < PLAYER_NAME_MIN_LENGTH || trimmed.length > PLAYER_NAME_MAX_LENGTH) {
-    throw createValidationError(
-      'Invalid player name length.',
-      `Name length must be between ${PLAYER_NAME_MIN_LENGTH} and ${PLAYER_NAME_MAX_LENGTH}.`
-    );
-  }
-
-  if (!PLAYER_NAME_REGEX.test(trimmed)) {
-    throw createValidationError(
-      'Invalid player name characters.',
-      'Allowed characters: letters, digits, spaces, underscores, hyphens.'
-    );
-  }
-
-  return trimmed;
-}
-
-function normalizeSafeMode(rawMode) {
-  const value = String(rawMode || '').trim().toLowerCase();
-  if (!SCORE_ALLOWED_MODES.has(value)) {
-    throw createValidationError(
-      'Invalid mode.',
-      `Mode must be one of: ${Array.from(SCORE_ALLOWED_MODES).join(', ')}.`
-    );
-  }
-  return value;
-}
-
-function normalizeSafeDifficulty(rawDifficulty) {
-  const value = String(rawDifficulty || '').trim().toLowerCase();
-  if (!SCORE_ALLOWED_DIFFICULTIES.has(value)) {
-    throw createValidationError(
-      'Invalid difficulty.',
-      `Difficulty must be one of: ${Array.from(SCORE_ALLOWED_DIFFICULTIES).join(', ')}.`
-    );
-  }
-  return value;
-}
-
-function normalizeOptionalMode(rawMode) {
-  const value = String(rawMode || '').trim().toLowerCase();
-  if (!value) return '';
-  if (!SCORE_ALLOWED_MODES.has(value)) {
-    throw createValidationError(
-      'Invalid mode filter.',
-      `mode must be one of: ${Array.from(SCORE_ALLOWED_MODES).join(', ')}.`
-    );
-  }
-  return value;
-}
-
-function normalizeOptionalDifficulty(rawDifficulty) {
-  const value = String(rawDifficulty || '').trim().toLowerCase();
-  if (!value) return '';
-  if (!SCORE_ALLOWED_DIFFICULTIES.has(value)) {
-    throw createValidationError(
-      'Invalid difficulty filter.',
-      `difficulty must be one of: ${Array.from(SCORE_ALLOWED_DIFFICULTIES).join(', ')}.`
-    );
-  }
-  return value;
-}
-
-function normalizeSafeScore(rawScore) {
-  const numeric = Number(rawScore);
-  if (!Number.isFinite(numeric)) {
-    throw createValidationError('Invalid score.', 'Score must be numeric.');
-  }
-
-  if (numeric < SCORE_MIN || numeric > SCORE_MAX) {
-    throw createValidationError(
-      'Score out of bounds.',
-      `Score must be between ${SCORE_MIN} and ${SCORE_MAX}.`
-    );
-  }
-
-  const rounded = roundTo(numeric, SCORE_MAX_DECIMALS);
-  if (Math.abs(rounded - numeric) > Number.EPSILON) {
-    throw createValidationError(
-      'Invalid score precision.',
-      `Score can have at most ${SCORE_MAX_DECIMALS} decimal places.`
-    );
-  }
-
-  return rounded;
-}
-
-function normalizeSafeRoundScore(rawScore) {
-  const numeric = Number(rawScore);
-  if (!Number.isFinite(numeric)) {
-    throw createValidationError('Invalid round score.', 'Round score must be numeric.');
-  }
-
-  if (numeric < ROUND_SCORE_MIN || numeric > ROUND_SCORE_MAX) {
-    throw createValidationError(
-      'Round score out of bounds.',
-      `Round score must be between ${ROUND_SCORE_MIN} and ${ROUND_SCORE_MAX}.`
-    );
-  }
-
-  const rounded = roundTo(numeric, SCORE_MAX_DECIMALS);
-  if (Math.abs(rounded - numeric) > Number.EPSILON) {
-    throw createValidationError(
-      'Invalid round score precision.',
-      `Round score can have at most ${SCORE_MAX_DECIMALS} decimal places.`
-    );
-  }
-
-  return rounded;
-}
-
-function normalizeRoundNumber(rawRound) {
-  const round = Number(rawRound);
-  if (!Number.isInteger(round) || round < 1 || round > GAME_ROUND_COUNT) {
-    throw createValidationError(
-      'Invalid round index.',
-      `round must be an integer between 1 and ${GAME_ROUND_COUNT}.`
-    );
-  }
-  return round;
-}
-
-function normalizeFrequencyRoundNumber(rawRound) {
-  const round = Number(rawRound);
-  if (!Number.isInteger(round) || round < 1 || round > FREQUENCY_ROUND_COUNT) {
-    throw createValidationError(
-      'Invalid round index.',
-      `round must be an integer between 1 and ${FREQUENCY_ROUND_COUNT}.`
-    );
-  }
-  return round;
-}
-
-function getFrequencyDifficultyConfig(difficulty) {
-  return String(difficulty || '').toLowerCase() === 'hard'
-    ? FREQUENCY_DIFFICULTY_CONFIG.hard
-    : FREQUENCY_DIFFICULTY_CONFIG.easy;
-}
-
-function normalizeFrequencyValue(rawFrequency, label = 'frequency') {
-  const value = Number(rawFrequency);
-  if (!Number.isFinite(value) || !Number.isInteger(value)) {
-    throw createValidationError(
-      `Invalid ${label}.`,
-      `${label} must be an integer.`
-    );
-  }
-  if (value < FREQUENCY_ABSOLUTE_MIN || value > FREQUENCY_ABSOLUTE_MAX) {
-    throw createValidationError(
-      `Invalid ${label}.`,
-      `${label} must be between ${FREQUENCY_ABSOLUTE_MIN} and ${FREQUENCY_ABSOLUTE_MAX} Hz.`
-    );
-  }
-  return value;
-}
-
-function normalizeStrictFrequencyGuess(rawGuess, round) {
-  assertObjectPayload(rawGuess, `guess #${round}`);
-  const keys = Object.keys(rawGuess);
-  const required = ['frequency'];
-  const allowed = new Set(required);
-  const missing = required.filter((field) => !keys.includes(field));
-  if (missing.length) {
-    throw createValidationError(
-      `Missing guess field(s) at round ${round}.`,
-      `Missing: ${missing.join(', ')}`
-    );
-  }
-  const unexpected = keys.filter((field) => !allowed.has(field));
-  if (unexpected.length) {
-    throw createValidationError(
-      `Unexpected guess field(s) at round ${round}.`,
-      `Unexpected: ${unexpected.join(', ')}`
-    );
-  }
-  return {
-    frequency: normalizeFrequencyValue(rawGuess.frequency, `guess #${round}.frequency`)
-  };
-}
-
-function normalizeSafeGameId(rawGameId) {
-  const value = String(rawGameId || '').trim();
-  if (!GAME_ID_REGEX.test(value)) {
-    throw createValidationError(
-      'Invalid gameId format.',
-      'gameId is malformed.'
-    );
-  }
-  return value;
-}
-
-function normalizeChallengeCode(rawCode) {
-  const value = String(rawCode || '').trim();
-  if (!value) return '';
-  if (!CHALLENGE_CODE_REGEX.test(value)) {
-    throw createValidationError(
-      'Invalid challengeCode format.',
-      'challengeCode must be 6-120 chars with letters, digits, underscores, or hyphens.'
-    );
-  }
-  return value;
-}
-
-function normalizeRequiredChallengeCode(rawCode, label = 'challengeCode') {
-  const value = normalizeChallengeCode(rawCode);
-  if (!value) {
-    throw createValidationError(
-      `Missing ${label}.`,
-      `${label} is required for multiplayer challenge pages.`
-    );
-  }
-  return value;
-}
-
-function sanitizeStoredName(rawName) {
-  const trimmed = String(rawName || '').trim().slice(0, PLAYER_NAME_MAX_LENGTH);
-  if (!trimmed) return 'Player';
-  if (PLAYER_NAME_REGEX.test(trimmed)) return trimmed;
-  const scrubbed = trimmed.replace(/[^A-Za-z0-9 _-]/g, '').trim();
-  return scrubbed.length >= PLAYER_NAME_MIN_LENGTH ? scrubbed : 'Player';
-}
-
-function clamp(n, min, max) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function roundTo(value, decimals) {
+function roundTo(value, decimals = 2) {
   const factor = 10 ** decimals;
-  return Math.round(value * factor) / factor;
-}
-
-function normalizeColor(color, label) {
-  const h = Number(color?.h);
-  const s = Number(color?.s);
-  const v = Number(color?.v);
-
-  if (!Number.isFinite(h) || !Number.isFinite(s) || !Number.isFinite(v)) {
-    throw createValidationError(
-      `Invalid ${label}.`,
-      `${label} must include numeric h, s, and v channels.`
-    );
-  }
-
-  if (!Number.isInteger(h) || h < 0 || h > 360) {
-    throw createValidationError(
-      `Invalid ${label}.h`,
-      `${label}.h must be an integer between 0 and 360.`
-    );
-  }
-  if (!Number.isInteger(s) || s < 0 || s > 100) {
-    throw createValidationError(
-      `Invalid ${label}.s`,
-      `${label}.s must be an integer between 0 and 100.`
-    );
-  }
-  if (!Number.isInteger(v) || v < 0 || v > 100) {
-    throw createValidationError(
-      `Invalid ${label}.v`,
-      `${label}.v must be an integer between 0 and 100.`
-    );
-  }
-
-  return { h, s, v };
-}
-
-function normalizeStrictGuess(rawGuess, round) {
-  assertObjectPayload(rawGuess, `guess #${round}`);
-  const keys = Object.keys(rawGuess);
-  const required = ['h', 's', 'v'];
-  const allowed = new Set(required);
-  const missing = required.filter((field) => !keys.includes(field));
-  if (missing.length) {
-    throw createValidationError(
-      `Missing guess field(s) at round ${round}.`,
-      `Missing: ${missing.join(', ')}`
-    );
-  }
-  const unexpected = keys.filter((field) => !allowed.has(field));
-  if (unexpected.length) {
-    throw createValidationError(
-      `Unexpected guess field(s) at round ${round}.`,
-      `Unexpected: ${unexpected.join(', ')}`
-    );
-  }
-  return normalizeColor(rawGuess, `guess #${round}`);
-}
-
-function mulberry32(seed) {
-  return function nextRand() {
-    let t = seed += 0x6D2B79F5;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function hashSeed(rawSeed) {
-  let h = 2166136261;
-  for (let i = 0; i < rawSeed.length; i += 1) {
-    h ^= rawSeed.charCodeAt(i);
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0;
-}
-
-function createSeededColors(seed, difficulty) {
-  const rand = mulberry32(hashSeed(`${seed}|${difficulty}`));
-  return Array.from({ length: GAME_ROUND_COUNT }, () => {
-    const h = Math.floor(rand() * 361);
-    let s = difficulty === 'easy' ? 42 + Math.floor(rand() * 54) : 18 + Math.floor(rand() * 78);
-    let v = difficulty === 'easy' ? 45 + Math.floor(rand() * 45) : 22 + Math.floor(rand() * 70);
-    if (difficulty === 'hard' && rand() > 0.55) {
-      s = 5 + Math.floor(rand() * 22);
-    }
-    return { h, s, v };
-  });
-}
-
-function seededRandomFrequency(rand, min, max) {
-  const minLog = Math.log2(min);
-  const maxLog = Math.log2(max);
-  const randomLog = minLog + (rand() * (maxLog - minLog));
-  return Math.round(2 ** randomLog);
-}
-
-function createSeededFrequencies(seed, difficulty) {
-  const rand = mulberry32(hashSeed(`frequency|${seed}|${difficulty}`));
-  const config = getFrequencyDifficultyConfig(difficulty);
-  return Array.from({ length: FREQUENCY_ROUND_COUNT }, () => (
-    seededRandomFrequency(rand, config.min, config.max)
-  ));
-}
-
-function normalizeTargetFrequencies(rawFrequencies, label = 'frequencies') {
-  if (!Array.isArray(rawFrequencies) || rawFrequencies.length !== FREQUENCY_ROUND_COUNT) {
-    throw new Error(`${label} must contain exactly ${FREQUENCY_ROUND_COUNT} entries.`);
-  }
-  return rawFrequencies.map((value, index) => normalizeFrequencyValue(value, `${label}[${index}]`));
-}
-
-function createRandomDailyFrequenciesForDifficulty(difficulty) {
-  const config = getFrequencyDifficultyConfig(difficulty);
-  return Array.from({ length: FREQUENCY_ROUND_COUNT }, () => (
-    seededRandomFrequency(Math.random, config.min, config.max)
-  ));
-}
-
-function parseDailyFrequencies(rawValue) {
-  try {
-    const parsed = JSON.parse(String(rawValue || '[]'));
-    if (!Array.isArray(parsed)) return null;
-    const normalized = parsed
-      .map((value) => {
-        try {
-          return normalizeFrequencyValue(value);
-        } catch {
-          return null;
-        }
-      })
-      .filter((value) => Number.isInteger(value));
-    if (normalized.length !== FREQUENCY_ROUND_COUNT) return null;
-    return normalized;
-  } catch {
-    return null;
-  }
-}
-
-function serializeDailyFrequencies(frequencies) {
-  const normalized = Array.isArray(frequencies)
-    ? frequencies
-      .map((value) => {
-        try {
-          return normalizeFrequencyValue(value);
-        } catch {
-          return null;
-        }
-      })
-      .filter((value) => Number.isInteger(value))
-    : [];
-  return JSON.stringify(normalized.slice(0, FREQUENCY_ROUND_COUNT));
-}
-
-function createFrequencyServerSeed({ mode, difficulty, challengeCode }) {
-  if (mode === 'daily') {
-    const dateKey = getUtcDayKey();
-    const digest = createHash('sha256')
-      .update(`frequency|daily|${dateKey}|${difficulty}`)
-      .digest('hex');
-    return `frequency|daily|${dateKey}|${digest.slice(0, 16)}`;
-  }
-
-  if (mode === 'challenge' && challengeCode) {
-    const digest = createHash('sha256')
-      .update(`frequency|challenge|${difficulty}|${challengeCode}`)
-      .digest('hex');
-    return `frequency|challenge|${digest.slice(0, 24)}`;
-  }
-
-  return `frequency|${mode}|${randomBytes(16).toString('hex')}`;
-}
-
-function hsvToRgb(h, s, v) {
-  const scaledS = s / 100;
-  const scaledV = v / 100;
-  const c = scaledV * scaledS;
-  const hh = h / 60;
-  const x = c * (1 - Math.abs((hh % 2) - 1));
-  let r = 0;
-  let g = 0;
-  let b = 0;
-
-  if (hh >= 0 && hh < 1) {
-    r = c; g = x; b = 0;
-  } else if (hh < 2) {
-    r = x; g = c; b = 0;
-  } else if (hh < 3) {
-    r = 0; g = c; b = x;
-  } else if (hh < 4) {
-    r = 0; g = x; b = c;
-  } else if (hh < 5) {
-    r = x; g = 0; b = c;
-  } else {
-    r = c; g = 0; b = x;
-  }
-
-  const m = scaledV - c;
-  return {
-    r: Math.round((r + m) * 255),
-    g: Math.round((g + m) * 255),
-    b: Math.round((b + m) * 255)
-  };
-}
-
-function rgbToXyz(rgb) {
-  let rr = rgb.r / 255;
-  let gg = rgb.g / 255;
-  let bb = rgb.b / 255;
-
-  rr = rr > 0.04045 ? ((rr + 0.055) / 1.055) ** 2.4 : rr / 12.92;
-  gg = gg > 0.04045 ? ((gg + 0.055) / 1.055) ** 2.4 : gg / 12.92;
-  bb = bb > 0.04045 ? ((bb + 0.055) / 1.055) ** 2.4 : bb / 12.92;
-
-  rr *= 100;
-  gg *= 100;
-  bb *= 100;
-
-  return {
-    x: (rr * 0.4124) + (gg * 0.3576) + (bb * 0.1805),
-    y: (rr * 0.2126) + (gg * 0.7152) + (bb * 0.0722),
-    z: (rr * 0.0193) + (gg * 0.1192) + (bb * 0.9505)
-  };
-}
-
-function xyzToLab(xyz) {
-  let xx = xyz.x / 95.047;
-  let yy = xyz.y / 100.0;
-  let zz = xyz.z / 108.883;
-
-  const f = (t) => (t > 0.008856 ? Math.cbrt(t) : ((7.787 * t) + (16 / 116)));
-  xx = f(xx);
-  yy = f(yy);
-  zz = f(zz);
-
-  return {
-    l: (116 * yy) - 16,
-    a: 500 * (xx - yy),
-    b: 200 * (yy - zz)
-  };
-}
-
-function colorToLab(color) {
-  return xyzToLab(rgbToXyz(hsvToRgb(color.h, color.s, color.v)));
-}
-
-function radians(degrees) {
-  return (degrees * Math.PI) / 180;
-}
-
-function degrees(radiansValue) {
-  return (radiansValue * 180) / Math.PI;
-}
-
-function deltaE2000(lab1, lab2) {
-  // CIEDE2000 implementation (kL = kC = kH = 1 for graphics use).
-  const L1 = lab1.l;
-  const a1 = lab1.a;
-  const b1 = lab1.b;
-  const L2 = lab2.l;
-  const a2 = lab2.a;
-  const b2 = lab2.b;
-
-  const C1 = Math.sqrt((a1 ** 2) + (b1 ** 2));
-  const C2 = Math.sqrt((a2 ** 2) + (b2 ** 2));
-  const avgC = (C1 + C2) / 2;
-  const pow25To7 = 6103515625;
-  const G = 0.5 * (1 - Math.sqrt((avgC ** 7) / ((avgC ** 7) + pow25To7)));
-
-  const a1Prime = (1 + G) * a1;
-  const a2Prime = (1 + G) * a2;
-  const C1Prime = Math.sqrt((a1Prime ** 2) + (b1 ** 2));
-  const C2Prime = Math.sqrt((a2Prime ** 2) + (b2 ** 2));
-  const avgCPrime = (C1Prime + C2Prime) / 2;
-
-  let h1Prime = Math.atan2(b1, a1Prime);
-  let h2Prime = Math.atan2(b2, a2Prime);
-  if (h1Prime < 0) h1Prime += 2 * Math.PI;
-  if (h2Prime < 0) h2Prime += 2 * Math.PI;
-
-  const deltaLPrime = L2 - L1;
-  const deltaCPrime = C2Prime - C1Prime;
-
-  let deltaHPrimeAngle = 0;
-  if (C1Prime * C2Prime !== 0) {
-    deltaHPrimeAngle = h2Prime - h1Prime;
-    if (deltaHPrimeAngle > Math.PI) deltaHPrimeAngle -= 2 * Math.PI;
-    if (deltaHPrimeAngle < -Math.PI) deltaHPrimeAngle += 2 * Math.PI;
-  }
-
-  const deltaHPrime = 2 * Math.sqrt(C1Prime * C2Prime) * Math.sin(deltaHPrimeAngle / 2);
-  const avgLPrime = (L1 + L2) / 2;
-
-  let avgHPrime = h1Prime + h2Prime;
-  if (C1Prime * C2Prime === 0) {
-    avgHPrime = h1Prime + h2Prime;
-  } else if (Math.abs(h1Prime - h2Prime) <= Math.PI) {
-    avgHPrime = (h1Prime + h2Prime) / 2;
-  } else if ((h1Prime + h2Prime) < (2 * Math.PI)) {
-    avgHPrime = (h1Prime + h2Prime + (2 * Math.PI)) / 2;
-  } else {
-    avgHPrime = (h1Prime + h2Prime - (2 * Math.PI)) / 2;
-  }
-
-  const T = 1
-    - (0.17 * Math.cos(avgHPrime - radians(30)))
-    + (0.24 * Math.cos(2 * avgHPrime))
-    + (0.32 * Math.cos((3 * avgHPrime) + radians(6)))
-    - (0.20 * Math.cos((4 * avgHPrime) - radians(63)));
-
-  const deltaTheta = radians(30) * Math.exp(-(((degrees(avgHPrime) - 275) / 25) ** 2));
-  const Rc = 2 * Math.sqrt((avgCPrime ** 7) / ((avgCPrime ** 7) + pow25To7));
-  const Sl = 1 + ((0.015 * ((avgLPrime - 50) ** 2)) / Math.sqrt(20 + ((avgLPrime - 50) ** 2)));
-  const Sc = 1 + (0.045 * avgCPrime);
-  const Sh = 1 + (0.015 * avgCPrime * T);
-  const Rt = -Math.sin(2 * deltaTheta) * Rc;
-
-  const lightnessTerm = deltaLPrime / Sl;
-  const chromaTerm = deltaCPrime / Sc;
-  const hueTerm = deltaHPrime / Sh;
-
-  return Math.sqrt(
-    (lightnessTerm ** 2)
-    + (chromaTerm ** 2)
-    + (hueTerm ** 2)
-    + (Rt * chromaTerm * hueTerm)
-  );
-}
-
-function hueDifference(a, b) {
-  const d = Math.abs(a - b) % 360;
-  return d > 180 ? 360 - d : d;
-}
-
-function computeRoundScore(target, guess) {
-  const dE = deltaE2000(colorToLab(target), colorToLab(guess));
-  const base = 10 / (1 + ((dE / 38) ** 1.6));
-  const hueDiff = hueDifference(target.h, guess.h);
-  const vividness = (target.s + guess.s) / 200;
-  const recovery = hueDiff <= 18 ? (1 - (hueDiff / 18)) * 1.15 * vividness : 0;
-  const penalty = (hueDiff > 42 && vividness > 0.35)
-    ? ((hueDiff - 42) / 138) * 2.2 * vividness
-    : 0;
-  const roundScore = clamp(base + recovery - penalty, 0, 10);
-
-  return {
-    dE,
-    roundScore
-  };
-}
-
-function computeFrequencyRoundScore(targetFrequency, guessFrequency, difficulty) {
-  const config = getFrequencyDifficultyConfig(difficulty);
-  const errorHz = Math.abs(guessFrequency - targetFrequency);
-  const errorRatio = errorHz / Math.max(1, targetFrequency);
-  const errorPercent = errorRatio * 100;
-  const normalizedError = errorRatio / config.tolerance;
-  const normalized = clamp(1 - normalizedError, 0, 1);
-  const curved = normalized ** 0.82;
-  const roundScore = clamp(curved * 10, 0, 10);
-
-  return {
-    errorHz: roundTo(errorHz, 2),
-    errorPercent: roundTo(errorPercent, 2),
-    roundScore: roundTo(roundScore, 2)
-  };
-}
-
-function createGameId() {
-  if (typeof randomUUID === 'function') {
-    return randomUUID();
-  }
-  return randomBytes(16).toString('hex');
-}
-
-function createServerSeed({ mode, difficulty, challengeCode }) {
-  if (mode === 'daily') {
-    const dateKey = getUtcDayKey();
-    const digest = createHash('sha256')
-      .update(`daily|${dateKey}|${difficulty}`)
-      .digest('hex');
-    return `daily|${dateKey}|${digest.slice(0, 16)}`;
-  }
-
-  if (mode === 'challenge' && challengeCode) {
-    const digest = createHash('sha256')
-      .update(`challenge|${difficulty}|${challengeCode}`)
-      .digest('hex');
-    return `challenge|${digest.slice(0, 24)}`;
-  }
-
-  return `${mode}|${randomBytes(16).toString('hex')}`;
-}
-
-function normalizeTargetColors(rawColors) {
-  if (!Array.isArray(rawColors) || rawColors.length !== GAME_ROUND_COUNT) {
-    throw new Error(`Target colors must contain exactly ${GAME_ROUND_COUNT} entries.`);
-  }
-  return rawColors.map((color, index) => normalizeColor(color, `target #${index + 1}`));
-}
-
-function pruneRateLimitStore(store, nowMs) {
-  if (store.size <= 1000) return;
-  for (const [key, value] of store) {
-    if (nowMs >= value.resetAt) {
-      store.delete(key);
-    }
-  }
-}
-
-function createIpRateLimitMiddleware({
-  store,
-  windowMs,
-  maxRequests,
-  errorMessage,
-  code
-}) {
-  const safeWindowMs = Math.max(1_000, Number(windowMs) || 60_000);
-  const safeMaxRequests = Math.max(1, Number(maxRequests) || 10);
-
-  return (req, res, next) => {
-    const ip = getClientIp(req);
-    const nowMs = Date.now();
-    const active = store.get(ip);
-
-    if (!active || nowMs >= active.resetAt) {
-      store.set(ip, { count: 1, resetAt: nowMs + safeWindowMs });
-    } else {
-      active.count += 1;
-      if (active.count > safeMaxRequests) {
-        const retryAfterSeconds = Math.max(1, Math.ceil((active.resetAt - nowMs) / 1000));
-        res.setHeader('Retry-After', String(retryAfterSeconds));
-        sendJsonError(
-          res,
-          429,
-          errorMessage,
-          `Rate limit: ${safeMaxRequests} requests per ${Math.floor(safeWindowMs / 1000)} seconds.`,
-          code
-        );
-        return;
-      }
-    }
-
-    pruneRateLimitStore(store, nowMs);
-    next();
-  };
-}
-
-const applyGameStartRateLimit = createIpRateLimitMiddleware({
-  store: gameStartRateLimitStore,
-  windowMs: GAME_START_WINDOW_MS,
-  maxRequests: GAME_START_MAX_REQUESTS,
-  errorMessage: 'Too many game start requests. Please wait and try again.',
-  code: 'GAME_START_RATE_LIMITED'
-});
-
-const applyGameCheckpointRateLimit = createIpRateLimitMiddleware({
-  store: gameCheckpointRateLimitStore,
-  windowMs: GAME_CHECKPOINT_WINDOW_MS,
-  maxRequests: GAME_CHECKPOINT_MAX_REQUESTS,
-  errorMessage: 'Too many round checkpoint requests. Please wait and try again.',
-  code: 'GAME_CHECKPOINT_RATE_LIMITED'
-});
-
-const applyGameSubmitRateLimit = createIpRateLimitMiddleware({
-  store: gameSubmitRateLimitStore,
-  windowMs: GAME_SUBMIT_WINDOW_MS,
-  maxRequests: GAME_SUBMIT_MAX_REQUESTS,
-  errorMessage: 'Too many game submit requests. Please wait and try again.',
-  code: 'GAME_SUBMIT_RATE_LIMITED'
-});
-
-const applyFrequencyStartRateLimit = createIpRateLimitMiddleware({
-  store: frequencyStartRateLimitStore,
-  windowMs: GAME_START_WINDOW_MS,
-  maxRequests: GAME_START_MAX_REQUESTS,
-  errorMessage: 'Too many frequency game start requests. Please wait and try again.',
-  code: 'FREQUENCY_START_RATE_LIMITED'
-});
-
-const applyFrequencyCheckpointRateLimit = createIpRateLimitMiddleware({
-  store: frequencyCheckpointRateLimitStore,
-  windowMs: GAME_CHECKPOINT_WINDOW_MS,
-  maxRequests: GAME_CHECKPOINT_MAX_REQUESTS,
-  errorMessage: 'Too many frequency checkpoint requests. Please wait and try again.',
-  code: 'FREQUENCY_CHECKPOINT_RATE_LIMITED'
-});
-
-const applyFrequencySubmitRateLimit = createIpRateLimitMiddleware({
-  store: frequencySubmitRateLimitStore,
-  windowMs: GAME_SUBMIT_WINDOW_MS,
-  maxRequests: GAME_SUBMIT_MAX_REQUESTS,
-  errorMessage: 'Too many frequency submit requests. Please wait and try again.',
-  code: 'FREQUENCY_SUBMIT_RATE_LIMITED'
-});
-
-function pruneExpiredGameSessions(nowMs = Date.now()) {
-  for (const [gameId, session] of activeGameSessions) {
-    if (nowMs >= (session.expiresAtMs + GAME_EXPIRED_GRACE_MS)) {
-      activeGameSessions.delete(gameId);
-    }
-  }
-
-  if (activeGameSessions.size <= GAME_STORE_MAX_ACTIVE) return;
-
-  const ordered = Array.from(activeGameSessions.entries())
-    .sort((a, b) => a[1].startedAtMs - b[1].startedAtMs);
-
-  const toRemove = activeGameSessions.size - GAME_STORE_MAX_ACTIVE;
-  for (let i = 0; i < toRemove; i += 1) {
-    activeGameSessions.delete(ordered[i][0]);
-  }
-}
-
-function pruneExpiredFrequencyGameSessions(nowMs = Date.now()) {
-  for (const [gameId, session] of activeFrequencyGameSessions) {
-    if (nowMs >= (session.expiresAtMs + GAME_EXPIRED_GRACE_MS)) {
-      activeFrequencyGameSessions.delete(gameId);
-    }
-  }
-
-  if (activeFrequencyGameSessions.size <= GAME_STORE_MAX_ACTIVE) return;
-
-  const ordered = Array.from(activeFrequencyGameSessions.entries())
-    .sort((a, b) => a[1].startedAtMs - b[1].startedAtMs);
-
-  const toRemove = activeFrequencyGameSessions.size - GAME_STORE_MAX_ACTIVE;
-  for (let i = 0; i < toRemove; i += 1) {
-    activeFrequencyGameSessions.delete(ordered[i][0]);
-  }
-}
-
-function validateGameStartPayload(payload) {
-  assertObjectPayload(payload, 'game start');
-  assertFieldPolicy(payload, {
-    allowedFields: GAME_START_ALLOWED_FIELDS,
-    requiredFields: GAME_START_REQUIRED_FIELDS,
-    payloadLabel: 'game start'
-  });
-
-  const safeMode = normalizeSafeMode(payload.mode);
-  const safeDifficulty = normalizeSafeDifficulty(payload.difficulty);
-  const challengeCode = normalizeChallengeCode(payload.challengeCode);
-
-  if (safeMode !== 'challenge' && challengeCode) {
-    throw createValidationError(
-      'Invalid challengeCode usage.',
-      'challengeCode can only be provided when mode is challenge.'
-    );
-  }
-
-  if (safeMode === 'challenge' && !challengeCode) {
-    throw createValidationError(
-      'Missing challengeCode for challenge mode.',
-      'challengeCode is required to bind the run to a dedicated multiplayer page.'
-    );
-  }
-
-  return {
-    mode: safeMode,
-    difficulty: safeDifficulty,
-    challengeCode
-  };
-}
-
-function validateGameSubmitPayload(payload) {
-  assertObjectPayload(payload, 'game submit');
-  assertFieldPolicy(payload, {
-    allowedFields: GAME_SUBMIT_ALLOWED_FIELDS,
-    requiredFields: GAME_SUBMIT_REQUIRED_FIELDS,
-    payloadLabel: 'game submit'
-  });
-
-  const gameId = normalizeSafeGameId(payload.gameId);
-  const name = normalizeSafeName(payload.name);
-
-  return {
-    gameId,
-    name
-  };
-}
-
-function validateGameCheckpointPayload(payload) {
-  assertObjectPayload(payload, 'game checkpoint');
-  assertFieldPolicy(payload, {
-    allowedFields: GAME_CHECKPOINT_ALLOWED_FIELDS,
-    requiredFields: GAME_CHECKPOINT_REQUIRED_FIELDS,
-    payloadLabel: 'game checkpoint'
-  });
-
-  const gameId = normalizeSafeGameId(payload.gameId);
-  const round = normalizeRoundNumber(payload.round);
-  const guess = normalizeStrictGuess(payload.guess, round);
-  const score = normalizeSafeRoundScore(payload.score);
-
-  return {
-    gameId,
-    round,
-    guess,
-    score
-  };
-}
-
-function validateFrequencyGameStartPayload(payload) {
-  assertObjectPayload(payload, 'frequency game start');
-  assertFieldPolicy(payload, {
-    allowedFields: FREQUENCY_START_ALLOWED_FIELDS,
-    requiredFields: FREQUENCY_START_REQUIRED_FIELDS,
-    payloadLabel: 'frequency game start'
-  });
-
-  const safeMode = normalizeSafeMode(payload.mode);
-  const safeDifficulty = normalizeSafeDifficulty(payload.difficulty);
-  const challengeCode = normalizeChallengeCode(payload.challengeCode);
-
-  if (safeMode !== 'challenge' && challengeCode) {
-    throw createValidationError(
-      'Invalid challengeCode usage.',
-      'challengeCode can only be provided when mode is challenge.'
-    );
-  }
-
-  return {
-    mode: safeMode,
-    difficulty: safeDifficulty,
-    challengeCode
-  };
-}
-
-function validateFrequencyGameSubmitPayload(payload) {
-  assertObjectPayload(payload, 'frequency game submit');
-  assertFieldPolicy(payload, {
-    allowedFields: FREQUENCY_SUBMIT_ALLOWED_FIELDS,
-    requiredFields: FREQUENCY_SUBMIT_REQUIRED_FIELDS,
-    payloadLabel: 'frequency game submit'
-  });
-
-  const gameId = normalizeSafeGameId(payload.gameId);
-  const name = normalizeSafeName(payload.name);
-
-  return {
-    gameId,
-    name
-  };
-}
-
-function validateFrequencyGameCheckpointPayload(payload) {
-  assertObjectPayload(payload, 'frequency game checkpoint');
-  assertFieldPolicy(payload, {
-    allowedFields: FREQUENCY_CHECKPOINT_ALLOWED_FIELDS,
-    requiredFields: FREQUENCY_CHECKPOINT_REQUIRED_FIELDS,
-    payloadLabel: 'frequency game checkpoint'
-  });
-
-  const gameId = normalizeSafeGameId(payload.gameId);
-  const round = normalizeFrequencyRoundNumber(payload.round);
-  const guess = normalizeStrictFrequencyGuess(payload.guess, round);
-  const score = normalizeSafeRoundScore(payload.score);
-
-  return {
-    gameId,
-    round,
-    guess,
-    score
-  };
-}
-
-function createRequestError(statusCode, error, detail, code) {
-  const issue = new Error(error);
-  issue.statusCode = statusCode;
-  issue.detail = detail || '';
-  issue.code = code || null;
-  return issue;
-}
-
-function requireActiveGameSession({ gameId, clientIp, nowMs }) {
-  const session = activeGameSessions.get(gameId);
-  if (!session) {
-    throw createRequestError(
-      404,
-      'Game session not found.',
-      'gameId does not exist or already expired.',
-      'GAME_NOT_FOUND'
-    );
-  }
-
-  if (nowMs >= session.expiresAtMs) {
-    throw createRequestError(
-      410,
-      'Game session expired.',
-      'Start a new game and submit again.',
-      'GAME_EXPIRED'
-    );
-  }
-
-  if (session.submitted) {
-    throw createRequestError(
-      409,
-      'Game session already submitted.',
-      'A gameId can be used only once.',
-      'GAME_ALREADY_SUBMITTED'
-    );
-  }
-
-  if (session.blocked) {
-    throw createRequestError(
-      409,
-      'Game session is blocked.',
-      String(session.blockedReason || 'Score mismatch detected.'),
-      'GAME_BLOCKED'
-    );
-  }
-
-  if (session.clientIp !== clientIp) {
-    throw createRequestError(
-      403,
-      'Game session IP mismatch.',
-      'This game session does not belong to the current client IP.',
-      'GAME_IP_MISMATCH'
-    );
-  }
-
-  return session;
-}
-
-function requireActiveFrequencyGameSession({ gameId, clientIp, nowMs }) {
-  const session = activeFrequencyGameSessions.get(gameId);
-  if (!session) {
-    throw createRequestError(
-      404,
-      'Frequency game session not found.',
-      'gameId does not exist or already expired.',
-      'FREQUENCY_GAME_NOT_FOUND'
-    );
-  }
-
-  if (nowMs >= session.expiresAtMs) {
-    throw createRequestError(
-      410,
-      'Frequency game session expired.',
-      'Start a new game and submit again.',
-      'FREQUENCY_GAME_EXPIRED'
-    );
-  }
-
-  if (session.submitted) {
-    throw createRequestError(
-      409,
-      'Frequency game already submitted.',
-      'A gameId can be used only once.',
-      'FREQUENCY_GAME_ALREADY_SUBMITTED'
-    );
-  }
-
-  if (session.blocked) {
-    throw createRequestError(
-      409,
-      'Frequency game is blocked.',
-      String(session.blockedReason || 'Score mismatch detected.'),
-      'FREQUENCY_GAME_BLOCKED'
-    );
-  }
-
-  if (session.clientIp !== clientIp) {
-    throw createRequestError(
-      403,
-      'Frequency game IP mismatch.',
-      'This game session does not belong to the current client IP.',
-      'FREQUENCY_GAME_IP_MISMATCH'
-    );
-  }
-
-  return session;
-}
-
-app.use((req, res, next) => {
-  const origin = String(req.headers.origin || '').trim();
-  if (origin) {
-    if (!isAllowedCorsOrigin(origin, req)) {
-      sendJsonError(res, 403, 'CORS origin is not allowed.', origin, 'CORS_FORBIDDEN');
-      return;
-    }
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Vary', 'Origin');
-  }
-
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Cluster-Peers');
-
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
-
-function normalizeMode(mode) {
-  const value = String(mode || '').toLowerCase();
-  if (value === 'daily') return 'daily';
-  if (value === 'challenge') return 'challenge';
-  return 'solo';
-}
-
-function normalizeDifficulty(difficulty) {
-  return String(difficulty || '').toLowerCase() === 'hard' ? 'hard' : 'easy';
-}
-
-function getClientIp(req) {
-  const forwarded = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
-  const socketIp = String(req.socket?.remoteAddress || req.ip || '').trim();
-  const value = (forwarded || socketIp || 'unknown').replace(/^::ffff:/, '');
-  return value || 'unknown';
-}
-
-function getStoredTimeExpr() {
-  return schemaState.hasCreatedAt ? `COALESCE(NULLIF(time,''), created_at)` : 'time';
+  return Math.round((Number(value) + Number.EPSILON) * factor) / factor;
 }
 
 function run(sql, params = []) {
@@ -1229,7 +62,7 @@ function run(sql, params = []) {
         reject(error);
         return;
       }
-      resolve(this);
+      resolve({ lastID: this.lastID, changes: this.changes });
     });
   });
 }
@@ -1241,7 +74,7 @@ function get(sql, params = []) {
         reject(error);
         return;
       }
-      resolve(row);
+      resolve(row || null);
     });
   });
 }
@@ -1253,626 +86,330 @@ function all(sql, params = []) {
         reject(error);
         return;
       }
-      resolve(rows || []);
+      resolve(Array.isArray(rows) ? rows : []);
     });
   });
 }
 
-async function ensureSchema() {
-  await run(`
-    CREATE TABLE IF NOT EXISTS scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      mode TEXT NOT NULL DEFAULT 'solo',
-      difficulty TEXT NOT NULL DEFAULT 'easy',
-      score REAL NOT NULL,
-      time TEXT NOT NULL
-    )
-  `);
-
-  const columns = await all('PRAGMA table_info(scores)');
-  const columnNames = new Set(columns.map((column) => String(column.name || '').toLowerCase()));
-  schemaState.hasCreatedAt = columnNames.has('created_at');
-  schemaState.hasChallengeCode = columnNames.has('challenge_code');
-
-  if (!columnNames.has('mode')) {
-    await run(`ALTER TABLE scores ADD COLUMN mode TEXT NOT NULL DEFAULT 'solo'`);
-  }
-  if (!columnNames.has('difficulty')) {
-    await run(`ALTER TABLE scores ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'easy'`);
-  }
-  if (!columnNames.has('time')) {
-    await run(`ALTER TABLE scores ADD COLUMN time TEXT NOT NULL DEFAULT ''`);
-  }
-  if (!columnNames.has('challenge_code')) {
-    await run(`ALTER TABLE scores ADD COLUMN challenge_code TEXT NOT NULL DEFAULT ''`);
-    schemaState.hasChallengeCode = true;
-  }
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS daily_challenges (
-      date_key TEXT PRIMARY KEY,
-      colors_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS daily_plays (
-      date_key TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      player_name TEXT NOT NULL,
-      score REAL NOT NULL,
-      played_at TEXT NOT NULL,
-      PRIMARY KEY(date_key, ip)
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS score_check_sessions (
-      game_id TEXT PRIMARY KEY,
-      mode TEXT NOT NULL,
-      difficulty TEXT NOT NULL,
-      seed TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      started_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      expected_rounds INTEGER NOT NULL,
-      checkpoint_count INTEGER NOT NULL DEFAULT 0,
-      ui_round_total REAL NOT NULL DEFAULT 0,
-      server_round_total REAL NOT NULL DEFAULT 0,
-      ui_final_score REAL,
-      server_final_score REAL,
-      status TEXT NOT NULL DEFAULT 'active',
-      blocked_reason TEXT NOT NULL DEFAULT '',
-      submitted_at TEXT,
-      promoted_at TEXT
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS score_check_rounds (
-      game_id TEXT NOT NULL,
-      round_no INTEGER NOT NULL,
-      guess_h INTEGER NOT NULL,
-      guess_s INTEGER NOT NULL,
-      guess_v INTEGER NOT NULL,
-      client_score REAL NOT NULL,
-      server_score REAL NOT NULL,
-      delta_e REAL NOT NULL,
-      checked_at TEXT NOT NULL,
-      PRIMARY KEY(game_id, round_no)
-    )
-  `);
-
-  await run(`CREATE INDEX IF NOT EXISTS idx_scores_rank ON scores(score DESC, time ASC)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_scores_challenge ON scores(mode, challenge_code, score DESC, time ASC)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_daily_plays_date ON daily_plays(date_key)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_score_check_sessions_status ON score_check_sessions(status, started_at)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_score_check_rounds_game ON score_check_rounds(game_id, round_no)`);
-
-  if (schemaState.hasCreatedAt) {
-    await run(`UPDATE scores SET time = created_at WHERE (time IS NULL OR trim(time)='') AND created_at IS NOT NULL`);
-  }
-  await run(`UPDATE scores SET mode='solo' WHERE mode IS NULL OR trim(mode)=''`);
-  await run(`UPDATE scores SET difficulty='easy' WHERE difficulty IS NULL OR trim(difficulty)=''`);
-  await run(`UPDATE scores SET time = datetime('now') WHERE time IS NULL OR trim(time)=''`);
-  if (schemaState.hasChallengeCode) {
-    await run(`UPDATE scores SET challenge_code='' WHERE challenge_code IS NULL`);
-  }
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS frequency_scores (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      mode TEXT NOT NULL DEFAULT 'solo',
-      difficulty TEXT NOT NULL DEFAULT 'easy',
-      score REAL NOT NULL,
-      time TEXT NOT NULL,
-      challenge_code TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL
-    )
-  `);
-
-  const frequencyColumns = await all('PRAGMA table_info(frequency_scores)');
-  const frequencyColumnNames = new Set(
-    frequencyColumns.map((column) => String(column.name || '').toLowerCase())
-  );
-  frequencySchemaState.hasCreatedAt = frequencyColumnNames.has('created_at');
-  frequencySchemaState.hasChallengeCode = frequencyColumnNames.has('challenge_code');
-
-  if (!frequencyColumnNames.has('mode')) {
-    await run(`ALTER TABLE frequency_scores ADD COLUMN mode TEXT NOT NULL DEFAULT 'solo'`);
-  }
-  if (!frequencyColumnNames.has('difficulty')) {
-    await run(`ALTER TABLE frequency_scores ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'easy'`);
-  }
-  if (!frequencyColumnNames.has('time')) {
-    await run(`ALTER TABLE frequency_scores ADD COLUMN time TEXT NOT NULL DEFAULT ''`);
-  }
-  if (!frequencyColumnNames.has('challenge_code')) {
-    await run(`ALTER TABLE frequency_scores ADD COLUMN challenge_code TEXT NOT NULL DEFAULT ''`);
-    frequencySchemaState.hasChallengeCode = true;
-  }
-  if (!frequencyColumnNames.has('created_at')) {
-    await run(`ALTER TABLE frequency_scores ADD COLUMN created_at TEXT NOT NULL DEFAULT ''`);
-    frequencySchemaState.hasCreatedAt = true;
-  }
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS frequency_daily_challenges (
-      date_key TEXT PRIMARY KEY,
-      easy_freqs_json TEXT NOT NULL,
-      hard_freqs_json TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS frequency_daily_plays (
-      date_key TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      player_name TEXT NOT NULL,
-      score REAL NOT NULL,
-      played_at TEXT NOT NULL,
-      PRIMARY KEY(date_key, ip)
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS frequency_score_check_sessions (
-      game_id TEXT PRIMARY KEY,
-      mode TEXT NOT NULL,
-      difficulty TEXT NOT NULL,
-      seed TEXT NOT NULL,
-      ip TEXT NOT NULL,
-      started_at TEXT NOT NULL,
-      expires_at TEXT NOT NULL,
-      expected_rounds INTEGER NOT NULL,
-      checkpoint_count INTEGER NOT NULL DEFAULT 0,
-      ui_round_total REAL NOT NULL DEFAULT 0,
-      server_round_total REAL NOT NULL DEFAULT 0,
-      ui_final_score REAL,
-      server_final_score REAL,
-      status TEXT NOT NULL DEFAULT 'active',
-      blocked_reason TEXT NOT NULL DEFAULT '',
-      submitted_at TEXT,
-      promoted_at TEXT
-    )
-  `);
-
-  await run(`
-    CREATE TABLE IF NOT EXISTS frequency_score_check_rounds (
-      game_id TEXT NOT NULL,
-      round_no INTEGER NOT NULL,
-      guess_frequency INTEGER NOT NULL,
-      client_score REAL NOT NULL,
-      server_score REAL NOT NULL,
-      error_hz REAL NOT NULL,
-      error_percent REAL NOT NULL,
-      checked_at TEXT NOT NULL,
-      PRIMARY KEY(game_id, round_no)
-    )
-  `);
-
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_rank ON frequency_scores(score DESC, time ASC)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_mode ON frequency_scores(mode, difficulty, score DESC, time ASC)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_challenge ON frequency_scores(mode, challenge_code, score DESC, time ASC)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_daily_plays_date ON frequency_daily_plays(date_key)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_check_sessions_status ON frequency_score_check_sessions(status, started_at)`);
-  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_check_rounds_game ON frequency_score_check_rounds(game_id, round_no)`);
-
-  await run(`UPDATE frequency_scores SET mode='solo' WHERE mode IS NULL OR trim(mode)=''`);
-  await run(`UPDATE frequency_scores SET difficulty='easy' WHERE difficulty IS NULL OR trim(difficulty)=''`);
-  await run(`UPDATE frequency_scores SET challenge_code='' WHERE challenge_code IS NULL`);
-  await run(`UPDATE frequency_scores SET time = datetime('now') WHERE time IS NULL OR trim(time)=''`);
-  await run(`UPDATE frequency_scores SET created_at = COALESCE(NULLIF(created_at, ''), time, datetime('now'))`);
+function createHttpError(statusCode, message, code = null, detail = '') {
+  const error = new Error(message);
+  error.statusCode = Number(statusCode) || 500;
+  error.code = code || null;
+  error.detail = detail || '';
+  return error;
 }
 
-async function cleanupDailyData(dateKey) {
-  await run(`DELETE FROM daily_plays WHERE date_key <> ?`, [dateKey]);
-  await run(`DELETE FROM daily_challenges WHERE date_key <> ?`, [dateKey]);
-}
-
-async function ensureDailyChallenge(dateKey) {
-  const row = await get(`SELECT colors_json FROM daily_challenges WHERE date_key = ?`, [dateKey]);
-  const parsed = parseDailyColors(row?.colors_json);
-  if (parsed) return parsed;
-
-  const colors = createRandomDailyColors();
-  const colorsJson = serializeDailyColors(colors);
-  const createdAt = new Date().toISOString();
-
-  await run(
-    `
-      INSERT INTO daily_challenges (date_key, colors_json, created_at)
-      VALUES (?, ?, ?)
-      ON CONFLICT(date_key) DO UPDATE SET
-        colors_json=excluded.colors_json,
-        created_at=excluded.created_at
-    `,
-    [dateKey, colorsJson, createdAt]
-  );
-
-  return colors;
-}
-
-async function getDailyStatus(ip) {
-  const dateKey = getUtcDayKey();
-  await cleanupDailyData(dateKey);
-  const colors = await ensureDailyChallenge(dateKey);
-  const play = await get(
-    `SELECT player_name, score, played_at FROM daily_plays WHERE date_key = ? AND ip = ?`,
-    [dateKey, ip]
-  );
-
-  return {
-    dateKey,
-    colors: normalizeTargetColors(colors),
-    ip,
-    playedToday: Boolean(play),
-    canPlay: !play,
-    playedEntry: play ? {
-      name: sanitizeStoredName(play.player_name),
-      score: Number(play.score || 0),
-      playedAt: String(play.played_at || '')
-    } : null
-  };
-}
-
-function openDatabase(filePath) {
-  return new Promise((resolve, reject) => {
-    const connection = new sqlite3.Database(filePath, (error) => {
-      if (error) {
-        reject(error);
-        return;
-      }
-      resolve(connection);
-    });
+function sendJsonError(res, statusCode, error, detail = '', code = null) {
+  res.status(Number(statusCode) || 500).json({
+    ok: false,
+    error: String(error || 'Unknown server error.'),
+    detail: String(detail || ''),
+    code: code || null
   });
 }
 
-async function readScores(limit) {
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
-  const rows = await all(
-    `
-      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
-      FROM scores
-      ORDER BY score DESC, stored_time ASC
-      LIMIT ?
-    `,
-    [safeLimit]
+function getUtcDayKey(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeMode(mode, allowEmpty = false) {
+  const value = String(mode || '').trim().toLowerCase();
+  if (!value && allowEmpty) return '';
+  if (MODES.has(value)) return value;
+  throw createHttpError(
+    400,
+    allowEmpty ? 'Invalid mode filter.' : 'Invalid mode.',
+    'INVALID_MODE',
+    `mode must be one of: ${Array.from(MODES).join(', ')}`
   );
+}
 
-  return rows.map((row, index) => {
-    const rawScore = Number(row.score);
-    const when = row.stored_time ? new Date(row.stored_time) : new Date();
+function normalizeDifficulty(difficulty, allowEmpty = false) {
+  const value = String(difficulty || '').trim().toLowerCase();
+  if (!value && allowEmpty) return '';
+  if (DIFFICULTIES.has(value)) return value;
+  throw createHttpError(
+    400,
+    allowEmpty ? 'Invalid difficulty filter.' : 'Invalid difficulty.',
+    'INVALID_DIFFICULTY',
+    `difficulty must be one of: ${Array.from(DIFFICULTIES).join(', ')}`
+  );
+}
 
-    return {
-      name: sanitizeStoredName(row.name),
-      mode: normalizeMode(row.mode),
-      difficulty: normalizeDifficulty(row.difficulty),
-      score: Number.isFinite(rawScore) ? rawScore : 0,
-      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
-      challengeCode: normalizeMode(row.mode) === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
-      rank: index + 1
-    };
+function normalizeChallengeCode(code, allowEmpty = true) {
+  const value = String(code || '').trim();
+  if (!value) {
+    if (allowEmpty) return '';
+    throw createHttpError(400, 'Missing challengeCode.', 'MISSING_CHALLENGE_CODE');
+  }
+  if (!CHALLENGE_CODE_REGEX.test(value)) {
+    throw createHttpError(
+      400,
+      'Invalid challengeCode format.',
+      'INVALID_CHALLENGE_CODE',
+      'challengeCode must be 3-120 chars with letters, digits, underscores, or hyphens.'
+    );
+  }
+  return value;
+}
+
+function normalizePlayerName(name) {
+  const value = String(name || '').trim();
+  if (!value) return 'Player';
+  if (value.length < PLAYER_NAME_MIN_LENGTH || value.length > PLAYER_NAME_MAX_LENGTH) {
+    throw createHttpError(
+      400,
+      'Invalid player name length.',
+      'INVALID_NAME_LENGTH',
+      `name must be ${PLAYER_NAME_MIN_LENGTH}-${PLAYER_NAME_MAX_LENGTH} chars.`
+    );
+  }
+  if (!PLAYER_NAME_REGEX.test(value)) {
+    throw createHttpError(
+      400,
+      'Invalid player name characters.',
+      'INVALID_NAME_CHARS',
+      'name can only contain letters, numbers, spaces, underscore, and hyphen.'
+    );
+  }
+  return value;
+}
+
+function normalizeGameId(gameId) {
+  const value = String(gameId || '').trim();
+  if (!GAME_ID_REGEX.test(value)) {
+    throw createHttpError(400, 'Invalid gameId format.', 'INVALID_GAME_ID');
+  }
+  return value;
+}
+
+function normalizeRound(round) {
+  const value = Number(round);
+  if (!Number.isInteger(value) || value < 1 || value > ROUND_COUNT) {
+    throw createHttpError(400, 'Invalid round index.', 'INVALID_ROUND', `round must be 1-${ROUND_COUNT}.`);
+  }
+  return value;
+}
+
+function normalizeFrequency(value, label = 'frequency') {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) {
+    throw createHttpError(400, `Invalid ${label}.`, 'INVALID_FREQUENCY', `${label} must be numeric.`);
+  }
+  return clamp(roundTo(parsed, 2), ABSOLUTE_MIN_HZ, ABSOLUTE_MAX_HZ);
+}
+
+function getDifficultyConfig(difficulty) {
+  const safeDifficulty = normalizeDifficulty(difficulty);
+  return DIFFICULTY_CONFIG[safeDifficulty];
+}
+
+function getClientIp(req) {
+  const rawForwarded = req.headers['x-forwarded-for'];
+  const forwarded = typeof rawForwarded === 'string' ? rawForwarded.split(',')[0].trim() : '';
+  const value = forwarded || req.socket?.remoteAddress || req.ip || 'unknown';
+  return String(value || 'unknown').replace(/^::ffff:/, '');
+}
+
+function parseFrequencyArray(rawJson) {
+  try {
+    const parsed = JSON.parse(String(rawJson || '[]'));
+    if (!Array.isArray(parsed) || parsed.length !== ROUND_COUNT) return null;
+    const values = parsed.map((item) => Number(item));
+    if (values.some((item) => !Number.isFinite(item))) return null;
+    return values.map((item) => roundTo(item, 2));
+  } catch {
+    return null;
+  }
+}
+
+function hashToUnit(seed) {
+  const digest = createHash('sha256').update(String(seed)).digest();
+  const int = digest.readUInt32BE(0);
+  return int / 0xffffffff;
+}
+
+function generateSeededFrequencies(seed, difficulty) {
+  const config = getDifficultyConfig(difficulty);
+  const span = config.max - config.min;
+  return Array.from({ length: ROUND_COUNT }, (_, index) => {
+    const unit = hashToUnit(`${seed}|${index + 1}`);
+    const value = config.min + unit * span;
+    return clamp(roundTo(value, 2), config.min, config.max);
   });
 }
 
-function buildLeaderboardFilter(mode, difficulty) {
-  const conditions = [];
-  const params = [];
-  if (mode) {
-    conditions.push('mode = ?');
-    params.push(mode);
-  }
-  if (difficulty) {
-    conditions.push('difficulty = ?');
-    params.push(difficulty);
-  }
-
-  return {
-    whereClause: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '',
-    params
-  };
-}
-
-async function readScoresFiltered(limit, { mode = '', difficulty = '' } = {}) {
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
-  const filter = buildLeaderboardFilter(mode, difficulty);
-  const rows = await all(
-    `
-      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
-      FROM scores
-      ${filter.whereClause}
-      ORDER BY score DESC, stored_time ASC
-      LIMIT ?
-    `,
-    [...filter.params, safeLimit]
-  );
-
-  return rows.map((row, index) => {
-    const rawScore = Number(row.score);
-    const when = row.stored_time ? new Date(row.stored_time) : new Date();
-
-    return {
-      name: sanitizeStoredName(row.name),
-      mode: normalizeMode(row.mode),
-      difficulty: normalizeDifficulty(row.difficulty),
-      score: Number.isFinite(rawScore) ? rawScore : 0,
-      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
-      challengeCode: normalizeMode(row.mode) === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
-      rank: index + 1
-    };
-  });
-}
-
-async function readChallengeScores(challengeCode, limit) {
-  const safeCode = normalizeRequiredChallengeCode(challengeCode, 'challengeCode');
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
-
-  const rows = await all(
-    `
-      SELECT name, mode, difficulty, score, ${getStoredTimeExpr()} AS stored_time
-      FROM scores
-      WHERE mode = 'challenge' AND challenge_code = ?
-      ORDER BY score DESC, stored_time ASC
-      LIMIT ?
-    `,
-    [safeCode, safeLimit]
-  );
-
-  return rows.map((row, index) => {
-    const rawScore = Number(row.score);
-    const when = row.stored_time ? new Date(row.stored_time) : new Date();
-    return {
-      name: sanitizeStoredName(row.name),
-      mode: 'challenge',
-      challengeCode: safeCode,
-      difficulty: normalizeDifficulty(row.difficulty),
-      score: Number.isFinite(rawScore) ? rawScore : 0,
-      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
-      rank: index + 1
-    };
-  });
-}
-
-async function readLeaderboardSummary({ mode = '', difficulty = '' } = {}) {
-  const filter = buildLeaderboardFilter(mode, difficulty);
-  const summaryRow = await get(
-    `
-      SELECT
-        COUNT(*) AS total_entries,
-        COUNT(DISTINCT name) AS unique_players,
-        COALESCE(AVG(score), 0) AS average_score,
-        COALESCE(MAX(score), 0) AS top_score,
-        MIN(${getStoredTimeExpr()}) AS first_score_at,
-        MAX(${getStoredTimeExpr()}) AS last_score_at
-      FROM scores
-      ${filter.whereClause}
-    `,
-    filter.params
-  );
-
-  const modeRows = await all(
-    `
-      SELECT mode, COUNT(*) AS entry_count
-      FROM scores
-      ${filter.whereClause}
-      GROUP BY mode
-      ORDER BY entry_count DESC
-    `,
-    filter.params
-  );
-
-  return {
-    totalEntries: Number(summaryRow?.total_entries) || 0,
-    uniquePlayers: Number(summaryRow?.unique_players) || 0,
-    averageScore: roundTo(Number(summaryRow?.average_score) || 0, 2),
-    topScore: roundTo(Number(summaryRow?.top_score) || 0, 2),
-    firstScoreAt: summaryRow?.first_score_at ? String(summaryRow.first_score_at) : '',
-    lastScoreAt: summaryRow?.last_score_at ? String(summaryRow.last_score_at) : '',
-    byMode: modeRows.map((row) => ({
-      mode: normalizeMode(row.mode),
-      count: Number(row.entry_count) || 0
-    }))
-  };
-}
-
-async function insertScore({ name, score, mode, difficulty, clientIp, challengeCode = '' }) {
-  const safeName = normalizeSafeName(name);
-  const safeScore = normalizeSafeScore(score);
-  const safeMode = normalizeSafeMode(mode);
-  const safeDifficulty = normalizeSafeDifficulty(difficulty);
-  const normalizedChallengeCode = normalizeChallengeCode(challengeCode);
-  const safeChallengeCode = safeMode === 'challenge'
-    ? normalizeRequiredChallengeCode(normalizedChallengeCode, 'challengeCode')
-    : '';
-  const savedAt = new Date();
-  const safeTime = savedAt.toISOString();
-
-  if (safeMode === 'daily') {
-    const daily = await getDailyStatus(clientIp);
-    if (!daily.canPlay) {
-      const error = new Error('Daily already played for this IP today.');
-      error.code = 'DAILY_ALREADY_PLAYED';
-      error.statusCode = 409;
-      error.detail = `date=${daily.dateKey} ip=${clientIp}`;
-      throw error;
-    }
-  }
-
-  if (schemaState.hasCreatedAt) {
-    await run(
-      `
-        INSERT INTO scores (name, mode, difficulty, score, time, challenge_code, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-      `,
-      [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode, safeTime]
-    );
-  } else {
-    await run(
-      `
-        INSERT INTO scores (name, mode, difficulty, score, time, challenge_code)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode]
-    );
-  }
-
-  if (safeMode === 'daily') {
-    await run(
-      `
-        INSERT INTO daily_plays (date_key, ip, player_name, score, played_at)
-        VALUES (?, ?, ?, ?, ?)
-      `,
-      [getUtcDayKey(savedAt), clientIp, safeName, safeScore, safeTime]
-    );
-  }
-
-  const rankRow = safeMode === 'challenge'
-    ? await get(
-      `
-        SELECT COUNT(*) AS totalHigher
-        FROM scores
-        WHERE mode = 'challenge'
-          AND challenge_code = ?
-          AND (
-            score > ?
-            OR (score = ? AND ${getStoredTimeExpr()} < ?)
-          )
-      `,
-      [safeChallengeCode, safeScore, safeScore, safeTime]
-    )
-    : await get(
-      `
-        SELECT COUNT(*) AS totalHigher
-        FROM scores
-        WHERE score > ?
-           OR (score = ? AND ${getStoredTimeExpr()} < ?)
-      `,
-      [safeScore, safeScore, safeTime]
-    );
-
-  const rank = (Number(rankRow?.totalHigher) || 0) + 1;
-  return {
-    name: safeName,
-    mode: safeMode,
-    difficulty: safeDifficulty,
-    challengeCode: safeChallengeCode,
-    score: safeScore,
-    time: safeTime,
-    rank
-  };
-}
-
-function getFrequencyStoredTimeExpr() {
-  return frequencySchemaState.hasCreatedAt
-    ? `COALESCE(NULLIF(time,''), created_at)`
-    : 'time';
-}
-
-async function cleanupFrequencyDailyData(dateKey) {
-  await run(`DELETE FROM frequency_daily_plays WHERE date_key <> ?`, [dateKey]);
-  await run(`DELETE FROM frequency_daily_challenges WHERE date_key <> ?`, [dateKey]);
+function generateRandomFrequencies(difficulty) {
+  const config = getDifficultyConfig(difficulty);
+  return Array.from({ length: ROUND_COUNT }, () => roundTo(randomInt(config.min, config.max + 1), 2));
 }
 
 async function ensureFrequencyDailyChallenge(dateKey) {
-  const row = await get(
+  const existing = await get(
     `SELECT easy_freqs_json, hard_freqs_json FROM frequency_daily_challenges WHERE date_key = ?`,
     [dateKey]
   );
 
-  const easyParsed = parseDailyFrequencies(row?.easy_freqs_json);
-  const hardParsed = parseDailyFrequencies(row?.hard_freqs_json);
-  if (easyParsed && hardParsed) {
-    return { easy: easyParsed, hard: hardParsed };
+  const parsedEasy = parseFrequencyArray(existing?.easy_freqs_json);
+  const parsedHard = parseFrequencyArray(existing?.hard_freqs_json);
+  if (parsedEasy && parsedHard) {
+    return { easy: parsedEasy, hard: parsedHard };
   }
 
-  const easyFrequencies = createRandomDailyFrequenciesForDifficulty('easy');
-  const hardFrequencies = createRandomDailyFrequenciesForDifficulty('hard');
-  const createdAt = new Date().toISOString();
+  const easy = generateSeededFrequencies(`frequency|daily|${dateKey}|easy`, 'easy');
+  const hard = generateSeededFrequencies(`frequency|daily|${dateKey}|hard`, 'hard');
+  const now = new Date().toISOString();
 
   await run(
     `
       INSERT INTO frequency_daily_challenges (date_key, easy_freqs_json, hard_freqs_json, created_at)
       VALUES (?, ?, ?, ?)
       ON CONFLICT(date_key) DO UPDATE SET
-        easy_freqs_json=excluded.easy_freqs_json,
-        hard_freqs_json=excluded.hard_freqs_json,
-        created_at=excluded.created_at
+        easy_freqs_json = excluded.easy_freqs_json,
+        hard_freqs_json = excluded.hard_freqs_json,
+        created_at = excluded.created_at
     `,
-    [
-      dateKey,
-      serializeDailyFrequencies(easyFrequencies),
-      serializeDailyFrequencies(hardFrequencies),
-      createdAt
-    ]
+    [dateKey, JSON.stringify(easy), JSON.stringify(hard), now]
   );
 
-  return {
-    easy: normalizeTargetFrequencies(easyFrequencies, 'daily.easy'),
-    hard: normalizeTargetFrequencies(hardFrequencies, 'daily.hard')
-  };
+  return { easy, hard };
 }
 
-async function getFrequencyDailyStatus(ip, difficulty) {
+async function getFrequencyDailyStatus(clientIp, difficulty) {
+  const safeDifficulty = normalizeDifficulty(difficulty);
   const dateKey = getUtcDayKey();
-  const safeDifficulty = normalizeSafeDifficulty(difficulty);
-  await cleanupFrequencyDailyData(dateKey);
-  const daily = await ensureFrequencyDailyChallenge(dateKey);
-  const play = await get(
-    `SELECT player_name, score, played_at FROM frequency_daily_plays WHERE date_key = ? AND ip = ?`,
-    [dateKey, ip]
+
+  await run(`DELETE FROM frequency_daily_challenges WHERE date_key <> ?`, [dateKey]);
+  await run(`DELETE FROM frequency_daily_plays WHERE date_key <> ?`, [dateKey]);
+
+  const challenge = await ensureFrequencyDailyChallenge(dateKey);
+  const played = await get(
+    `
+      SELECT player_name, score, played_at
+      FROM frequency_daily_plays
+      WHERE date_key = ? AND ip = ? AND difficulty = ?
+    `,
+    [dateKey, clientIp, safeDifficulty]
   );
 
   return {
     dateKey,
     difficulty: safeDifficulty,
-    frequencies: safeDifficulty === 'hard' ? daily.hard : daily.easy,
-    ip,
-    playedToday: Boolean(play),
-    canPlay: !play,
-    playedEntry: play ? {
-      name: sanitizeStoredName(play.player_name),
-      score: Number(play.score || 0),
-      playedAt: String(play.played_at || '')
-    } : null
+    canPlay: !played,
+    playedEntry: played
+      ? {
+          name: String(played.player_name || 'Player'),
+          score: roundTo(Number(played.score) || 0, 2),
+          time: String(played.played_at || new Date().toISOString())
+        }
+      : null,
+    frequencies: safeDifficulty === 'hard' ? challenge.hard : challenge.easy
   };
 }
 
-async function readFrequencyScores(limit) {
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
-  const rows = await all(
-    `
-      SELECT name, mode, difficulty, score, ${getFrequencyStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
-      FROM frequency_scores
-      ORDER BY score DESC, stored_time ASC
-      LIMIT ?
-    `,
-    [safeLimit]
-  );
+function computeRoundScore(target, guess, difficulty) {
+  const config = getDifficultyConfig(difficulty);
+  const errorHz = Math.abs(guess - target);
+  const errorPercent = (errorHz / target) * 100;
+  const normalizedError = (errorHz / target) / config.tolerance;
+  const normalized = clamp(1 - normalizedError, 0, 1);
+  const curved = Math.pow(normalized, 0.82);
+  const score = roundTo(curved * 10, 2);
 
-  return rows.map((row, index) => {
-    const rawScore = Number(row.score);
-    const when = row.stored_time ? new Date(row.stored_time) : new Date();
-    const mode = normalizeMode(row.mode);
-    return {
-      name: sanitizeStoredName(row.name),
-      mode,
-      difficulty: normalizeDifficulty(row.difficulty),
-      score: Number.isFinite(rawScore) ? rawScore : 0,
-      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
-      challengeCode: mode === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
-      rank: index + 1
-    };
+  return {
+    target: roundTo(target, 2),
+    guess: roundTo(guess, 2),
+    errorHz: roundTo(errorHz, 2),
+    errorPercent: roundTo(errorPercent, 2),
+    score
+  };
+}
+
+function pruneExpiredSessions(nowMs = Date.now()) {
+  for (const [id, session] of gameSessions.entries()) {
+    if (session.expiresAt <= nowMs) {
+      gameSessions.delete(id);
+    }
+  }
+
+  if (gameSessions.size <= MAX_ACTIVE_SESSIONS) return;
+
+  const sorted = Array.from(gameSessions.values())
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(0, gameSessions.size - MAX_ACTIVE_SESSIONS);
+
+  sorted.forEach((session) => {
+    gameSessions.delete(session.gameId);
   });
 }
 
-function buildFrequencyLeaderboardFilter(mode, difficulty) {
+function createSession({ mode, difficulty, ip, challengeCode, frequencies }) {
+  const gameId = randomUUID();
+  const now = Date.now();
+  const session = {
+    gameId,
+    mode,
+    difficulty,
+    ip,
+    challengeCode: challengeCode || '',
+    frequencies,
+    results: [],
+    createdAt: now,
+    expiresAt: now + SESSION_TTL_MS,
+    submittedAt: 0
+  };
+  gameSessions.set(gameId, session);
+  return session;
+}
+
+function getSessionOrThrow(gameId, clientIp) {
+  const safeGameId = normalizeGameId(gameId);
+  const session = gameSessions.get(safeGameId);
+
+  if (!session) {
+    throw createHttpError(404, 'Game session not found.', 'GAME_NOT_FOUND');
+  }
+  if (Date.now() > session.expiresAt) {
+    gameSessions.delete(safeGameId);
+    throw createHttpError(410, 'Game session expired.', 'GAME_EXPIRED');
+  }
+  if (session.submittedAt) {
+    throw createHttpError(409, 'Game session already submitted.', 'GAME_ALREADY_SUBMITTED');
+  }
+  if (session.ip !== clientIp) {
+    throw createHttpError(403, 'Game session IP mismatch.', 'GAME_IP_MISMATCH');
+  }
+
+  return session;
+}
+
+function normalizeStartPayload(payload) {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const mode = normalizeMode(body.mode);
+  const difficulty = normalizeDifficulty(body.difficulty);
+  const challengeCode = normalizeChallengeCode(body.challengeCode, true);
+  return { mode, difficulty, challengeCode };
+}
+
+function normalizeCheckpointPayload(payload) {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const gameId = normalizeGameId(body.gameId);
+  const round = normalizeRound(body.round);
+  const guessFrequency = normalizeFrequency(body?.guess?.frequency, 'guess.frequency');
+  return { gameId, round, guessFrequency };
+}
+
+function normalizeSubmitPayload(payload) {
+  const body = payload && typeof payload === 'object' ? payload : {};
+  const gameId = normalizeGameId(body.gameId);
+  const name = normalizePlayerName(body.name);
+  return { gameId, name };
+}
+
+function buildLeaderboardFilter(mode, difficulty) {
   const conditions = [];
   const params = [];
+
   if (mode) {
     conditions.push('mode = ?');
     params.push(mode);
@@ -1888,54 +425,57 @@ function buildFrequencyLeaderboardFilter(mode, difficulty) {
   };
 }
 
-async function readFrequencyScoresFiltered(limit, { mode = '', difficulty = '' } = {}) {
-  const safeLimit = Math.max(1, Math.min(500, Number(limit) || 10));
-  const filter = buildFrequencyLeaderboardFilter(mode, difficulty);
+function normalizeLimit(rawLimit, defaultLimit = 100, maxLimit = 200) {
+  const parsed = Number(rawLimit);
+  if (!Number.isFinite(parsed)) return defaultLimit;
+  return Math.floor(clamp(parsed, 1, maxLimit));
+}
+
+async function readFrequencyLeaderboard(limit, { mode = '', difficulty = '' } = {}) {
+  const filter = buildLeaderboardFilter(mode, difficulty);
+  const safeLimit = normalizeLimit(limit, 100, 200);
+
   const rows = await all(
     `
-      SELECT name, mode, difficulty, score, ${getFrequencyStoredTimeExpr()} AS stored_time, COALESCE(challenge_code, '') AS challenge_code
+      SELECT name, mode, difficulty, score, time, COALESCE(challenge_code, '') AS challenge_code
       FROM frequency_scores
       ${filter.whereClause}
-      ORDER BY score DESC, stored_time ASC
+      ORDER BY score DESC, time ASC
       LIMIT ?
     `,
     [...filter.params, safeLimit]
   );
 
-  return rows.map((row, index) => {
-    const rawScore = Number(row.score);
-    const when = row.stored_time ? new Date(row.stored_time) : new Date();
-    const modeValue = normalizeMode(row.mode);
-    return {
-      name: sanitizeStoredName(row.name),
-      mode: modeValue,
-      difficulty: normalizeDifficulty(row.difficulty),
-      score: Number.isFinite(rawScore) ? rawScore : 0,
-      time: Number.isNaN(when.getTime()) ? new Date().toISOString() : when.toISOString(),
-      challengeCode: modeValue === 'challenge' ? normalizeChallengeCode(row.challenge_code) : '',
-      rank: index + 1
-    };
-  });
+  return rows.map((row, index) => ({
+    name: String(row.name || 'Player'),
+    mode: normalizeMode(row.mode),
+    difficulty: normalizeDifficulty(row.difficulty),
+    score: roundTo(Number(row.score) || 0, 2),
+    time: row.time ? new Date(row.time).toISOString() : new Date().toISOString(),
+    challengeCode: String(row.challenge_code || ''),
+    rank: index + 1
+  }));
 }
 
 async function readFrequencyLeaderboardSummary({ mode = '', difficulty = '' } = {}) {
-  const filter = buildFrequencyLeaderboardFilter(mode, difficulty);
-  const summaryRow = await get(
+  const filter = buildLeaderboardFilter(mode, difficulty);
+
+  const totals = await get(
     `
       SELECT
         COUNT(*) AS total_entries,
         COUNT(DISTINCT name) AS unique_players,
         COALESCE(AVG(score), 0) AS average_score,
         COALESCE(MAX(score), 0) AS top_score,
-        MIN(${getFrequencyStoredTimeExpr()}) AS first_score_at,
-        MAX(${getFrequencyStoredTimeExpr()}) AS last_score_at
+        MIN(time) AS first_score_at,
+        MAX(time) AS last_score_at
       FROM frequency_scores
       ${filter.whereClause}
     `,
     filter.params
   );
 
-  const modeRows = await all(
+  const byModeRows = await all(
     `
       SELECT mode, COUNT(*) AS entry_count
       FROM frequency_scores
@@ -1947,13 +487,13 @@ async function readFrequencyLeaderboardSummary({ mode = '', difficulty = '' } = 
   );
 
   return {
-    totalEntries: Number(summaryRow?.total_entries) || 0,
-    uniquePlayers: Number(summaryRow?.unique_players) || 0,
-    averageScore: roundTo(Number(summaryRow?.average_score) || 0, 2),
-    topScore: roundTo(Number(summaryRow?.top_score) || 0, 2),
-    firstScoreAt: summaryRow?.first_score_at ? String(summaryRow.first_score_at) : '',
-    lastScoreAt: summaryRow?.last_score_at ? String(summaryRow.last_score_at) : '',
-    byMode: modeRows.map((row) => ({
+    totalEntries: Number(totals?.total_entries) || 0,
+    uniquePlayers: Number(totals?.unique_players) || 0,
+    averageScore: roundTo(Number(totals?.average_score) || 0, 2),
+    topScore: roundTo(Number(totals?.top_score) || 0, 2),
+    firstScoreAt: totals?.first_score_at ? String(totals.first_score_at) : '',
+    lastScoreAt: totals?.last_score_at ? String(totals.last_score_at) : '',
+    byMode: byModeRows.map((row) => ({
       mode: normalizeMode(row.mode),
       count: Number(row.entry_count) || 0
     }))
@@ -1961,24 +501,22 @@ async function readFrequencyLeaderboardSummary({ mode = '', difficulty = '' } = 
 }
 
 async function insertFrequencyScore({ name, score, mode, difficulty, clientIp, challengeCode = '' }) {
-  const safeName = normalizeSafeName(name);
-  const safeScore = normalizeSafeScore(score);
-  const safeMode = normalizeSafeMode(mode);
-  const safeDifficulty = normalizeSafeDifficulty(difficulty);
-  const safeChallengeCode = safeMode === 'challenge'
-    ? normalizeChallengeCode(challengeCode)
-    : '';
-  const savedAt = new Date();
-  const safeTime = savedAt.toISOString();
+  const safeName = normalizePlayerName(name);
+  const safeMode = normalizeMode(mode);
+  const safeDifficulty = normalizeDifficulty(difficulty);
+  const safeScore = roundTo(clamp(Number(score) || 0, 0, 50), 2);
+  const safeChallengeCode = safeMode === 'challenge' ? normalizeChallengeCode(challengeCode, true) : '';
+  const now = new Date().toISOString();
 
   if (safeMode === 'daily') {
     const daily = await getFrequencyDailyStatus(clientIp, safeDifficulty);
     if (!daily.canPlay) {
-      const error = new Error('Daily already played for this IP today.');
-      error.code = 'DAILY_ALREADY_PLAYED';
-      error.statusCode = 409;
-      error.detail = `date=${daily.dateKey} ip=${clientIp}`;
-      throw error;
+      throw createHttpError(
+        409,
+        'Daily already played for this IP today.',
+        'DAILY_ALREADY_PLAYED',
+        `date=${daily.dateKey} ip=${clientIp}`
+      );
     }
   }
 
@@ -1987,1338 +525,484 @@ async function insertFrequencyScore({ name, score, mode, difficulty, clientIp, c
       INSERT INTO frequency_scores (name, mode, difficulty, score, time, challenge_code, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `,
-    [safeName, safeMode, safeDifficulty, safeScore, safeTime, safeChallengeCode, safeTime]
+    [safeName, safeMode, safeDifficulty, safeScore, now, safeChallengeCode, now]
   );
 
   if (safeMode === 'daily') {
+    const dateKey = getUtcDayKey();
     await run(
       `
-        INSERT INTO frequency_daily_plays (date_key, ip, player_name, score, played_at)
-        VALUES (?, ?, ?, ?, ?)
+        INSERT INTO frequency_daily_plays (date_key, ip, difficulty, player_name, score, played_at)
+        VALUES (?, ?, ?, ?, ?, ?)
       `,
-      [getUtcDayKey(savedAt), clientIp, safeName, safeScore, safeTime]
+      [dateKey, clientIp, safeDifficulty, safeName, safeScore, now]
     );
   }
 
-  const rankRow = safeMode === 'challenge'
-    ? await get(
-      `
-        SELECT COUNT(*) AS totalHigher
-        FROM frequency_scores
-        WHERE mode = 'challenge'
-          AND challenge_code = ?
-          AND (
-            score > ?
-            OR (score = ? AND ${getFrequencyStoredTimeExpr()} < ?)
-          )
-      `,
-      [safeChallengeCode, safeScore, safeScore, safeTime]
-    )
-    : await get(
-      `
-        SELECT COUNT(*) AS totalHigher
-        FROM frequency_scores
-        WHERE score > ?
-           OR (score = ? AND ${getFrequencyStoredTimeExpr()} < ?)
-      `,
-      [safeScore, safeScore, safeTime]
-    );
+  let rankQuery = `
+    SELECT COUNT(*) AS ahead
+    FROM frequency_scores
+    WHERE mode = ?
+      AND difficulty = ?
+      AND (score > ? OR (score = ? AND time < ?))
+  `;
+  let rankParams = [safeMode, safeDifficulty, safeScore, safeScore, now];
 
-  const rank = (Number(rankRow?.totalHigher) || 0) + 1;
+  if (safeMode === 'challenge' && safeChallengeCode) {
+    rankQuery = `
+      SELECT COUNT(*) AS ahead
+      FROM frequency_scores
+      WHERE mode = ?
+        AND difficulty = ?
+        AND challenge_code = ?
+        AND (score > ? OR (score = ? AND time < ?))
+    `;
+    rankParams = [safeMode, safeDifficulty, safeChallengeCode, safeScore, safeScore, now];
+  }
+
+  const rankRow = await get(rankQuery, rankParams);
+
   return {
     name: safeName,
+    score: safeScore,
     mode: safeMode,
     difficulty: safeDifficulty,
-    challengeCode: safeChallengeCode,
-    score: safeScore,
-    time: safeTime,
-    rank
+    rank: (Number(rankRow?.ahead) || 0) + 1,
+    time: now,
+    challengeCode: safeChallengeCode
   };
 }
 
-async function createFrequencyScoreCheckSessionRecord({
-  gameId,
-  mode,
-  difficulty,
-  seed,
-  clientIp,
-  startedAtMs,
-  expiresAtMs,
-  expectedRounds
-}) {
-  await run(
-    `
-      INSERT INTO frequency_score_check_sessions (
-        game_id, mode, difficulty, seed, ip,
-        started_at, expires_at, expected_rounds,
-        checkpoint_count, ui_round_total, server_round_total,
-        status, blocked_reason
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', '')
-    `,
-    [
-      gameId,
-      mode,
-      difficulty,
-      seed,
-      clientIp,
-      new Date(startedAtMs).toISOString(),
-      new Date(expiresAtMs).toISOString(),
-      expectedRounds
-    ]
-  );
+function isLocalhostName(name) {
+  const value = String(name || '').toLowerCase();
+  return value === 'localhost' || value === '127.0.0.1' || value === '::1';
 }
 
-async function readFrequencyScoreCheckRoundSummary(gameId) {
-  const row = await get(
-    `
-      SELECT
-        COUNT(*) AS checkpoint_count,
-        COALESCE(SUM(client_score), 0) AS ui_round_total,
-        COALESCE(SUM(server_score), 0) AS server_round_total
-      FROM frequency_score_check_rounds
-      WHERE game_id = ?
-    `,
-    [gameId]
-  );
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
 
-  return {
-    checkpointCount: Number(row?.checkpoint_count) || 0,
-    uiRoundTotal: roundTo(Number(row?.ui_round_total) || 0, 2),
-    serverRoundTotal: roundTo(Number(row?.server_round_total) || 0, 2)
-  };
+  if (FRONTEND_ORIGINS.size > 0) {
+    if (FRONTEND_ORIGINS.has(origin)) return true;
+    try {
+      const parsed = new URL(origin);
+      return isLocalhostName(parsed.hostname);
+    } catch {
+      return false;
+    }
+  }
+
+  return true;
 }
 
-async function updateFrequencyScoreCheckSessionProgress(gameId) {
-  const summary = await readFrequencyScoreCheckRoundSummary(gameId);
-  await run(
-    `
-      UPDATE frequency_score_check_sessions
-      SET checkpoint_count = ?, ui_round_total = ?, server_round_total = ?
-      WHERE game_id = ?
-    `,
-    [summary.checkpointCount, summary.uiRoundTotal, summary.serverRoundTotal, gameId]
-  );
-  return summary;
-}
+app.use((req, res, next) => {
+  const origin = typeof req.headers.origin === 'string' ? req.headers.origin : '';
 
-async function markFrequencyScoreCheckSessionBlocked(gameId, reason) {
-  await run(
-    `
-      UPDATE frequency_score_check_sessions
-      SET status = 'blocked', blocked_reason = ?
-      WHERE game_id = ?
-    `,
-    [String(reason || 'Score mismatch detected.'), gameId]
-  );
-}
+  if (origin && isAllowedOrigin(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Requested-With, X-Cluster-Peers');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
 
-async function markFrequencyScoreCheckSessionSubmitted(gameId, uiFinalScore, serverFinalScore, submittedAtIso) {
-  await run(
-    `
-      UPDATE frequency_score_check_sessions
-      SET ui_final_score = ?, server_final_score = ?, submitted_at = ?
-      WHERE game_id = ?
-    `,
-    [uiFinalScore, serverFinalScore, submittedAtIso, gameId]
-  );
-}
-
-async function markFrequencyScoreCheckSessionPromoted(gameId, promotedAtIso) {
-  await run(
-    `
-      UPDATE frequency_score_check_sessions
-      SET status = 'promoted', promoted_at = ?
-      WHERE game_id = ?
-    `,
-    [promotedAtIso, gameId]
-  );
-}
-
-async function readFrequencyScoreCheckRounds(gameId) {
-  return all(
-    `
-      SELECT round_no, server_score, error_hz, error_percent
-      FROM frequency_score_check_rounds
-      WHERE game_id = ?
-      ORDER BY round_no ASC
-    `,
-    [gameId]
-  );
-}
-
-function isSqliteUniqueConstraint(error) {
-  return /UNIQUE constraint failed/i.test(String(error?.message || ''));
-}
-
-async function createScoreCheckSessionRecord({
-  gameId,
-  mode,
-  difficulty,
-  seed,
-  clientIp,
-  startedAtMs,
-  expiresAtMs,
-  expectedRounds
-}) {
-  await run(
-    `
-      INSERT INTO score_check_sessions (
-        game_id, mode, difficulty, seed, ip,
-        started_at, expires_at, expected_rounds,
-        checkpoint_count, ui_round_total, server_round_total,
-        status, blocked_reason
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 'active', '')
-    `,
-    [
-      gameId,
-      mode,
-      difficulty,
-      seed,
-      clientIp,
-      new Date(startedAtMs).toISOString(),
-      new Date(expiresAtMs).toISOString(),
-      expectedRounds
-    ]
-  );
-}
-
-async function readScoreCheckRoundSummary(gameId) {
-  const row = await get(
-    `
-      SELECT
-        COUNT(*) AS checkpoint_count,
-        COALESCE(SUM(client_score), 0) AS ui_round_total,
-        COALESCE(SUM(server_score), 0) AS server_round_total
-      FROM score_check_rounds
-      WHERE game_id = ?
-    `,
-    [gameId]
-  );
-
-  return {
-    checkpointCount: Number(row?.checkpoint_count) || 0,
-    uiRoundTotal: roundTo(Number(row?.ui_round_total) || 0, 2),
-    serverRoundTotal: roundTo(Number(row?.server_round_total) || 0, 2)
-  };
-}
-
-async function updateScoreCheckSessionProgress(gameId) {
-  const summary = await readScoreCheckRoundSummary(gameId);
-  await run(
-    `
-      UPDATE score_check_sessions
-      SET checkpoint_count = ?, ui_round_total = ?, server_round_total = ?
-      WHERE game_id = ?
-    `,
-    [summary.checkpointCount, summary.uiRoundTotal, summary.serverRoundTotal, gameId]
-  );
-  return summary;
-}
-
-async function markScoreCheckSessionBlocked(gameId, reason) {
-  await run(
-    `
-      UPDATE score_check_sessions
-      SET status = 'blocked', blocked_reason = ?
-      WHERE game_id = ?
-    `,
-    [String(reason || 'Score mismatch detected.'), gameId]
-  );
-}
-
-async function markScoreCheckSessionSubmitted(gameId, uiFinalScore, serverFinalScore, submittedAtIso) {
-  await run(
-    `
-      UPDATE score_check_sessions
-      SET ui_final_score = ?, server_final_score = ?, submitted_at = ?
-      WHERE game_id = ?
-    `,
-    [uiFinalScore, serverFinalScore, submittedAtIso, gameId]
-  );
-}
-
-async function markScoreCheckSessionPromoted(gameId, promotedAtIso) {
-  await run(
-    `
-      UPDATE score_check_sessions
-      SET status = 'promoted', promoted_at = ?
-      WHERE game_id = ?
-    `,
-    [promotedAtIso, gameId]
-  );
-}
-
-async function readScoreCheckRounds(gameId) {
-  return all(
-    `
-      SELECT round_no, server_score, delta_e
-      FROM score_check_rounds
-      WHERE game_id = ?
-      ORDER BY round_no ASC
-    `,
-    [gameId]
-  );
-}
-
-app.get('/challenge/:challengeCode', (req, res, next) => {
-  const code = String(req.params.challengeCode || '').trim();
-  if (!CHALLENGE_CODE_REGEX.test(code)) {
-    next();
+  if (req.method === 'OPTIONS') {
+    if (origin && !isAllowedOrigin(origin)) {
+      res.status(403).end();
+      return;
+    }
+    res.status(204).end();
     return;
   }
-  res.sendFile(path.join(__dirname, 'index.html'));
+
+  next();
 });
 
-app.get('/api/health', (_req, res) => {
-  pruneExpiredGameSessions();
-  pruneExpiredFrequencyGameSessions();
+app.use(express.json({ limit: '128kb' }));
+
+app.get('/api/health', async (req, res) => {
+  let tableCount = 0;
+  try {
+    const row = await get(`SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table'`);
+    tableCount = Number(row?.count) || 0;
+  } catch {
+    tableCount = 0;
+  }
+
   res.json({
     ok: true,
-    apiVersion: 2,
-    scoringModel: 'ciede2000',
+    service: 'frequency-game-server',
+    version: VERSION,
+    host: HOST,
+    dbPath: SQLITE_DB_PATH,
+    tableCount,
+    now: new Date().toISOString(),
     features: {
       leaderboardV2: true,
-      checkpointGate: true,
-      challengeDedicatedPages: true,
-      frequencyGameV1: true
-    },
-    host: HOST,
-    port: activePort,
-    dbType: 'sqlite',
-    dbPath: SQLITE_DB_PATH,
-    utcDay: getUtcDayKey(),
-    activeGameSessions: activeGameSessions.size,
-    activeFrequencyGameSessions: activeFrequencyGameSessions.size
+      dailyMode: true,
+      challengeMode: true,
+      frequency: true
+    }
   });
 });
 
-app.get('/favicon.ico', (_req, res) => {
-  res.status(204).end();
-});
-
-app.get('/api/whoami', (req, res) => {
-  res.json({ ip: getClientIp(req) });
-});
-
-app.get('/api/daily', async (req, res) => {
-  try {
-    const status = await getDailyStatus(getClientIp(req));
-    res.json(status);
-  } catch (error) {
-    sendJsonError(
-      res,
-      500,
-      'Failed to load daily challenge.',
-      String(error?.message || error),
-      'DAILY_STATUS_ERROR'
-    );
-  }
-});
-
-app.get('/api/challenges/:challengeCode/scores', async (req, res) => {
-  const parsedLimit = Number(req.query.limit);
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
-  let challengeCode = '';
-
-  try {
-    challengeCode = normalizeRequiredChallengeCode(req.params.challengeCode, 'challengeCode');
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid challenge code.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const entries = await readChallengeScores(challengeCode, limit);
-    res.json({
-      challengeCode,
-      entries,
-      totalEntries: entries.length
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      500,
-      'Failed to read challenge leaderboard.',
-      String(error?.message || error),
-      'CHALLENGE_SCORES_READ_ERROR'
-    );
-  }
-});
-
-app.get('/api/scores', async (req, res) => {
-  const parsedLimit = Number(req.query.limit);
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 10;
-  let modeFilter = '';
-  let difficultyFilter = '';
-
-  try {
-    modeFilter = normalizeOptionalMode(req.query.mode);
-    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid score query.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const rows = await readScoresFiltered(limit, {
-      mode: modeFilter,
-      difficulty: difficultyFilter
-    });
-    res.json(rows);
-  } catch (error) {
-    sendJsonError(
-      res,
-      500,
-      'Failed to read scores from SQLite.',
-      String(error?.message || error),
-      'SCORES_READ_ERROR'
-    );
-  }
-});
-
-app.get('/api/leaderboard', async (req, res) => {
-  const parsedLimit = Number(req.query.limit);
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
-  let modeFilter = '';
-  let difficultyFilter = '';
-
-  try {
-    modeFilter = normalizeOptionalMode(req.query.mode);
-    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid leaderboard query.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const [entries, summary] = await Promise.all([
-      readScoresFiltered(limit, { mode: modeFilter, difficulty: difficultyFilter }),
-      readLeaderboardSummary({ mode: modeFilter, difficulty: difficultyFilter })
-    ]);
-    res.json({
-      entries,
-      summary,
-      filters: {
-        mode: modeFilter || null,
-        difficulty: difficultyFilter || null
-      }
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      500,
-      'Failed to read leaderboard summary.',
-      String(error?.message || error),
-      'LEADERBOARD_READ_ERROR'
-    );
-  }
-});
-
-app.post('/api/game/start', applyGameStartRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateGameStartPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid game start payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredGameSessions(nowMs);
-
-  try {
-    let dailyColors = null;
-    if (safeInput.mode === 'daily') {
-      const daily = await getDailyStatus(clientIp);
-      if (!daily.canPlay) {
-        sendJsonError(
-          res,
-          409,
-          'Daily already played for this IP today.',
-          `date=${daily.dateKey} ip=${clientIp}`,
-          'DAILY_ALREADY_PLAYED'
-        );
-        return;
-      }
-      dailyColors = daily.colors;
-    }
-
-    const seed = createServerSeed({
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode
-    });
-    const normalizedColors = safeInput.mode === 'daily'
-      ? normalizeTargetColors(dailyColors)
-      : normalizeTargetColors(createSeededColors(seed, safeInput.difficulty));
-    const gameId = createGameId();
-    const startedAtMs = nowMs;
-    const expiresAtMs = startedAtMs + GAME_TTL_MS;
-
-    activeGameSessions.set(gameId, {
-      id: gameId,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode || '',
-      seed,
-      targets: normalizedColors,
-      clientIp,
-      startedAtMs,
-      expiresAtMs,
-      submitted: false,
-      blocked: false,
-      blockedReason: '',
-      checkpoints: [],
-      runningRawScore: 0,
-      runningScore: 0,
-      nextRound: 1
-    });
-
-    await createScoreCheckSessionRecord({
-      gameId,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      seed,
-      clientIp,
-      startedAtMs,
-      expiresAtMs,
-      expectedRounds: normalizedColors.length
-    });
-
-    res.status(201).json({
-      gameId,
-      seed,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode || '',
-      startedAt: startedAtMs,
-      expiresAt: expiresAtMs,
-      roundCount: normalizedColors.length,
-      colors: normalizedColors
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 500,
-      error?.message || 'Failed to start game session.',
-      error?.detail || String(error?.message || error),
-      error?.code || 'GAME_START_ERROR'
-    );
-  }
-});
-
-app.post('/api/game/checkpoint', applyGameCheckpointRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateGameCheckpointPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid game checkpoint payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredGameSessions(nowMs);
-
-  let session;
-  try {
-    session = requireActiveGameSession({
-      gameId: safeInput.gameId,
-      clientIp,
-      nowMs
-    });
-  } catch (error) {
-    if (error?.code === 'GAME_EXPIRED') {
-      activeGameSessions.delete(safeInput.gameId);
-    }
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid game session.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const expectedRound = session.nextRound;
-    if (safeInput.round !== expectedRound) {
-      throw createRequestError(
-        409,
-        'Round checkpoint out of order.',
-        `Expected round ${expectedRound} but received round ${safeInput.round}.`,
-        'GAME_ROUND_OUT_OF_ORDER'
-      );
-    }
-
-    const target = session.targets[safeInput.round - 1];
-    const computed = computeRoundScore(target, safeInput.guess);
-    const serverRoundScore = roundTo(computed.roundScore, 2);
-    const checkedAtIso = new Date(nowMs).toISOString();
-
-    try {
-      await run(
-        `
-          INSERT INTO score_check_rounds (
-            game_id, round_no, guess_h, guess_s, guess_v,
-            client_score, server_score, delta_e, checked_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          session.id,
-          safeInput.round,
-          safeInput.guess.h,
-          safeInput.guess.s,
-          safeInput.guess.v,
-          safeInput.score,
-          serverRoundScore,
-          roundTo(computed.dE, 2),
-          checkedAtIso
-        ]
-      );
-    } catch (error) {
-      if (isSqliteUniqueConstraint(error)) {
-        throw createRequestError(
-          409,
-          'Round checkpoint already recorded.',
-          `Round ${safeInput.round} has already been checkpointed for this game.`,
-          'GAME_ROUND_ALREADY_CHECKPOINTED'
-        );
-      }
-      throw error;
-    }
-
-    const summary = await updateScoreCheckSessionProgress(session.id);
-
-    if (safeInput.score !== serverRoundScore) {
-      session.blocked = true;
-      session.blockedReason = `Round ${safeInput.round} mismatch (client=${safeInput.score}, server=${serverRoundScore}).`;
-      await markScoreCheckSessionBlocked(session.id, session.blockedReason);
-      throw createRequestError(
-        409,
-        'Round score mismatch detected.',
-        session.blockedReason,
-        'SCORE_MISMATCH_ROUND'
-      );
-    }
-
-    session.checkpoints.push({
-      round: safeInput.round,
-      guess: safeInput.guess,
-      clientScore: safeInput.score,
-      serverScore: serverRoundScore,
-      serverRawScore: computed.roundScore,
-      deltaE: roundTo(computed.dE, 2),
-      checkedAtMs: nowMs
-    });
-    session.runningRawScore = summary.serverRoundTotal;
-    session.runningScore = summary.serverRoundTotal;
-    session.nextRound = safeInput.round + 1;
-
-    res.status(201).json({
-      ok: true,
-      gameId: session.id,
-      round: safeInput.round,
-      acceptedScore: serverRoundScore,
-      runningScore: session.runningScore,
-      remainingRounds: Math.max(0, session.targets.length - summary.checkpointCount)
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 500,
-      error?.message || 'Failed to checkpoint round.',
-      error?.detail || String(error?.message || error),
-      error?.code || 'GAME_CHECKPOINT_ERROR'
-    );
-  }
-});
-
-app.post('/api/game/submit', applyGameSubmitRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateGameSubmitPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid game submit payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredGameSessions(nowMs);
-
-  let session;
-  try {
-    session = requireActiveGameSession({
-      gameId: safeInput.gameId,
-      clientIp,
-      nowMs
-    });
-  } catch (error) {
-    if (error?.code === 'GAME_EXPIRED') {
-      activeGameSessions.delete(safeInput.gameId);
-    }
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid game session.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const summary = await readScoreCheckRoundSummary(session.id);
-    if (summary.checkpointCount !== session.targets.length) {
-      throw createRequestError(
-        409,
-        'Game is not complete.',
-        `Expected ${session.targets.length} checkpoint rounds but received ${summary.checkpointCount}.`,
-        'GAME_INCOMPLETE'
-      );
-    }
-
-    const serverFinalScore = summary.serverRoundTotal;
-    const submittedAtIso = new Date(nowMs).toISOString();
-    const stagedUiFinalScore = summary.uiRoundTotal;
-
-    await markScoreCheckSessionSubmitted(session.id, stagedUiFinalScore, serverFinalScore, submittedAtIso);
-
-    if (stagedUiFinalScore !== serverFinalScore) {
-      session.blocked = true;
-      session.blockedReason = `Final score mismatch (staged_ui=${stagedUiFinalScore}, server=${serverFinalScore}).`;
-      await markScoreCheckSessionBlocked(session.id, session.blockedReason);
-      throw createRequestError(
-        409,
-        'Final score mismatch detected.',
-        session.blockedReason,
-        'SCORE_MISMATCH_FINAL'
-      );
-    }
-
-    const saved = await insertScore({
-      name: safeInput.name,
-      score: serverFinalScore,
-      mode: session.mode,
-      difficulty: session.difficulty,
-      clientIp,
-      challengeCode: session.challengeCode || ''
-    });
-
-    session.submitted = true;
-    session.submittedAtMs = nowMs;
-    session.score = serverFinalScore;
-    session.runningRawScore = serverFinalScore;
-    session.runningScore = serverFinalScore;
-    await markScoreCheckSessionPromoted(session.id, submittedAtIso);
-    const roundRows = await readScoreCheckRounds(session.id);
-
-    // TODO(security-hardening): migrate activeGameSessions to Redis/DB for
-    // multi-instance deployments and durable anti-replay checks.
-    res.status(201).json({
-      ...saved,
-      gameId: session.id,
-      startedAt: session.startedAtMs,
-      expiresAt: session.expiresAtMs,
-      submittedAt: nowMs,
-      roundCount: roundRows.length,
-      rounds: roundRows.map((round) => ({
-        round: Number(round.round_no),
-        score: Number(round.server_score),
-        deltaE: Number(round.delta_e)
-      }))
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 500,
-      error?.message || 'Failed to submit game result.',
-      error?.detail || String(error?.message || error),
-      error?.code || 'GAME_SUBMIT_ERROR'
-    );
-  }
-});
-
 app.get('/api/frequency/daily', async (req, res) => {
-  let difficulty = 'easy';
-  try {
-    difficulty = normalizeSafeDifficulty(req.query.difficulty || 'easy');
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid daily query.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
+  const clientIp = getClientIp(req);
 
   try {
-    const status = await getFrequencyDailyStatus(getClientIp(req), difficulty);
-    res.json(status);
+    const difficulty = normalizeDifficulty(req.query.difficulty || 'easy');
+    const daily = await getFrequencyDailyStatus(clientIp, difficulty);
+    res.json(daily);
   } catch (error) {
     sendJsonError(
       res,
-      500,
-      'Failed to load frequency daily challenge.',
-      String(error?.message || error),
-      'FREQUENCY_DAILY_STATUS_ERROR'
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to load frequency daily challenge.',
+      error?.detail || '',
+      error?.code || 'FREQUENCY_DAILY_ERROR'
     );
   }
 });
 
 app.get('/api/frequency/scores', async (req, res) => {
-  const parsedLimit = Number(req.query.limit);
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 10;
-  let modeFilter = '';
-  let difficultyFilter = '';
+  const limit = normalizeLimit(req.query.limit, 100, 200);
 
   try {
-    modeFilter = normalizeOptionalMode(req.query.mode);
-    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency score query.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
-    const rows = await readFrequencyScoresFiltered(limit, {
-      mode: modeFilter,
-      difficulty: difficultyFilter
-    });
+    const mode = normalizeMode(req.query.mode, true);
+    const difficulty = normalizeDifficulty(req.query.difficulty, true);
+    const rows = await readFrequencyLeaderboard(limit, { mode, difficulty });
     res.json(rows);
   } catch (error) {
     sendJsonError(
       res,
-      500,
-      'Failed to read frequency scores from SQLite.',
-      String(error?.message || error),
-      'FREQUENCY_SCORE_READ_ERROR'
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to read frequency scores.',
+      error?.detail || '',
+      error?.code || 'FREQUENCY_SCORE_READ_ERROR'
     );
   }
 });
 
 app.get('/api/frequency/leaderboard', async (req, res) => {
-  const parsedLimit = Number(req.query.limit);
-  const limit = Number.isFinite(parsedLimit) ? parsedLimit : 100;
-  let modeFilter = '';
-  let difficultyFilter = '';
+  const limit = normalizeLimit(req.query.limit, 100, 200);
 
   try {
-    modeFilter = normalizeOptionalMode(req.query.mode);
-    difficultyFilter = normalizeOptionalDifficulty(req.query.difficulty);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency leaderboard query.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  try {
+    const mode = normalizeMode(req.query.mode, true);
+    const difficulty = normalizeDifficulty(req.query.difficulty, true);
     const [entries, summary] = await Promise.all([
-      readFrequencyScoresFiltered(limit, { mode: modeFilter, difficulty: difficultyFilter }),
-      readFrequencyLeaderboardSummary({ mode: modeFilter, difficulty: difficultyFilter })
+      readFrequencyLeaderboard(limit, { mode, difficulty }),
+      readFrequencyLeaderboardSummary({ mode, difficulty })
     ]);
+
     res.json({
       entries,
       summary,
       filters: {
-        mode: modeFilter || null,
-        difficulty: difficultyFilter || null
+        mode: mode || null,
+        difficulty: difficulty || null
       }
-    });
-  } catch (error) {
-    sendJsonError(
-      res,
-      500,
-      'Failed to read frequency leaderboard summary.',
-      String(error?.message || error),
-      'FREQUENCY_LEADERBOARD_READ_ERROR'
-    );
-  }
-});
-
-app.post('/api/frequency/game/start', applyFrequencyStartRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateFrequencyGameStartPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency game start payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredFrequencyGameSessions(nowMs);
-
-  try {
-    let dailyFrequencies = null;
-    if (safeInput.mode === 'daily') {
-      const daily = await getFrequencyDailyStatus(clientIp, safeInput.difficulty);
-      if (!daily.canPlay) {
-        sendJsonError(
-          res,
-          409,
-          'Daily already played for this IP today.',
-          `date=${daily.dateKey} ip=${clientIp}`,
-          'DAILY_ALREADY_PLAYED'
-        );
-        return;
-      }
-      dailyFrequencies = daily.frequencies;
-    }
-
-    const seed = createFrequencyServerSeed({
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode
-    });
-    const targetFrequencies = safeInput.mode === 'daily'
-      ? normalizeTargetFrequencies(dailyFrequencies, 'daily.frequencies')
-      : normalizeTargetFrequencies(
-        createSeededFrequencies(seed, safeInput.difficulty),
-        'seeded.frequencies'
-      );
-    const gameId = createGameId();
-    const startedAtMs = nowMs;
-    const expiresAtMs = startedAtMs + GAME_TTL_MS;
-
-    activeFrequencyGameSessions.set(gameId, {
-      id: gameId,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode || '',
-      seed,
-      targets: targetFrequencies,
-      clientIp,
-      startedAtMs,
-      expiresAtMs,
-      submitted: false,
-      blocked: false,
-      blockedReason: '',
-      checkpoints: [],
-      runningRawScore: 0,
-      runningScore: 0,
-      nextRound: 1
-    });
-
-    await createFrequencyScoreCheckSessionRecord({
-      gameId,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      seed,
-      clientIp,
-      startedAtMs,
-      expiresAtMs,
-      expectedRounds: targetFrequencies.length
-    });
-
-    res.status(201).json({
-      gameId,
-      seed,
-      mode: safeInput.mode,
-      difficulty: safeInput.difficulty,
-      challengeCode: safeInput.challengeCode || '',
-      startedAt: startedAtMs,
-      expiresAt: expiresAtMs,
-      roundCount: targetFrequencies.length,
-      frequencies: targetFrequencies
     });
   } catch (error) {
     sendJsonError(
       res,
       Number(error?.statusCode) || 500,
-      error?.message || 'Failed to start frequency game session.',
-      error?.detail || String(error?.message || error),
+      error?.message || 'Failed to read frequency leaderboard.',
+      error?.detail || '',
+      error?.code || 'FREQUENCY_LEADERBOARD_ERROR'
+    );
+  }
+});
+
+app.post('/api/frequency/game/start', async (req, res) => {
+  pruneExpiredSessions();
+
+  try {
+    const safeInput = normalizeStartPayload(req.body);
+    const clientIp = getClientIp(req);
+
+    let frequencies = [];
+    if (safeInput.mode === 'daily') {
+      const daily = await getFrequencyDailyStatus(clientIp, safeInput.difficulty);
+      if (!daily.canPlay) {
+        throw createHttpError(
+          409,
+          'Daily already played for this IP today.',
+          'DAILY_ALREADY_PLAYED',
+          `date=${daily.dateKey} ip=${clientIp}`
+        );
+      }
+      frequencies = Array.isArray(daily.frequencies) ? daily.frequencies.slice(0, ROUND_COUNT) : [];
+    } else if (safeInput.mode === 'challenge' && safeInput.challengeCode) {
+      frequencies = generateSeededFrequencies(
+        `frequency|challenge|${safeInput.difficulty}|${safeInput.challengeCode}`,
+        safeInput.difficulty
+      );
+    } else {
+      frequencies = generateRandomFrequencies(safeInput.difficulty);
+    }
+
+    if (!Array.isArray(frequencies) || frequencies.length !== ROUND_COUNT) {
+      throw createHttpError(500, 'Unable to generate target frequencies.', 'FREQUENCY_GENERATION_ERROR');
+    }
+
+    const session = createSession({
+      mode: safeInput.mode,
+      difficulty: safeInput.difficulty,
+      ip: clientIp,
+      challengeCode: safeInput.challengeCode,
+      frequencies
+    });
+
+    res.json({
+      ok: true,
+      gameId: session.gameId,
+      mode: session.mode,
+      difficulty: session.difficulty,
+      challengeCode: session.challengeCode,
+      frequencies: session.frequencies
+    });
+  } catch (error) {
+    sendJsonError(
+      res,
+      Number(error?.statusCode) || 500,
+      error?.message || 'Failed to start frequency game.',
+      error?.detail || '',
       error?.code || 'FREQUENCY_GAME_START_ERROR'
     );
   }
 });
 
-app.post('/api/frequency/game/checkpoint', applyFrequencyCheckpointRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateFrequencyGameCheckpointPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency game checkpoint payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredFrequencyGameSessions(nowMs);
-
-  let session;
-  try {
-    session = requireActiveFrequencyGameSession({
-      gameId: safeInput.gameId,
-      clientIp,
-      nowMs
-    });
-  } catch (error) {
-    if (error?.code === 'FREQUENCY_GAME_EXPIRED') {
-      activeFrequencyGameSessions.delete(safeInput.gameId);
-    }
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency game session.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
+app.post('/api/frequency/game/checkpoint', async (req, res) => {
+  pruneExpiredSessions();
 
   try {
-    const expectedRound = session.nextRound;
+    const safeInput = normalizeCheckpointPayload(req.body);
+    const clientIp = getClientIp(req);
+    const session = getSessionOrThrow(safeInput.gameId, clientIp);
+
+    const expectedRound = session.results.length + 1;
     if (safeInput.round !== expectedRound) {
-      throw createRequestError(
+      throw createHttpError(
         409,
-        'Round checkpoint out of order.',
-        `Expected round ${expectedRound} but received round ${safeInput.round}.`,
-        'FREQUENCY_ROUND_OUT_OF_ORDER'
+        'Checkpoint out of sequence.',
+        'CHECKPOINT_OUT_OF_SEQUENCE',
+        `expectedRound=${expectedRound}`
       );
     }
 
-    const difficultyConfig = getFrequencyDifficultyConfig(session.difficulty);
-    if (
-      safeInput.guess.frequency < difficultyConfig.min
-      || safeInput.guess.frequency > difficultyConfig.max
-    ) {
-      throw createRequestError(
-        409,
-        'Guess out of range for this difficulty.',
-        `Expected ${difficultyConfig.min}-${difficultyConfig.max} Hz.`,
-        'FREQUENCY_GUESS_OUT_OF_RANGE'
-      );
+    const target = Number(session.frequencies[safeInput.round - 1]);
+    if (!Number.isFinite(target)) {
+      throw createHttpError(500, 'Missing target frequency for this round.', 'MISSING_TARGET');
     }
 
-    const target = session.targets[safeInput.round - 1];
-    const computed = computeFrequencyRoundScore(target, safeInput.guess.frequency, session.difficulty);
-    const serverRoundScore = computed.roundScore;
-    const checkedAtIso = new Date(nowMs).toISOString();
+    const result = computeRoundScore(target, safeInput.guessFrequency, session.difficulty);
+    session.results.push({ round: safeInput.round, ...result });
 
-    try {
-      await run(
-        `
-          INSERT INTO frequency_score_check_rounds (
-            game_id, round_no, guess_frequency,
-            client_score, server_score, error_hz, error_percent, checked_at
-          )
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        `,
-        [
-          session.id,
-          safeInput.round,
-          safeInput.guess.frequency,
-          safeInput.score,
-          serverRoundScore,
-          computed.errorHz,
-          computed.errorPercent,
-          checkedAtIso
-        ]
-      );
-    } catch (error) {
-      if (isSqliteUniqueConstraint(error)) {
-        throw createRequestError(
-          409,
-          'Round checkpoint already recorded.',
-          `Round ${safeInput.round} has already been checkpointed for this game.`,
-          'FREQUENCY_ROUND_ALREADY_CHECKPOINTED'
-        );
-      }
-      throw error;
-    }
+    const runningScore = roundTo(
+      session.results.reduce((sum, item) => sum + Number(item.score || 0), 0),
+      2
+    );
 
-    const summary = await updateFrequencyScoreCheckSessionProgress(session.id);
-
-    if (safeInput.score !== serverRoundScore) {
-      session.blocked = true;
-      session.blockedReason = `Round ${safeInput.round} mismatch (client=${safeInput.score}, server=${serverRoundScore}).`;
-      await markFrequencyScoreCheckSessionBlocked(session.id, session.blockedReason);
-      throw createRequestError(
-        409,
-        'Round score mismatch detected.',
-        session.blockedReason,
-        'FREQUENCY_SCORE_MISMATCH_ROUND'
-      );
-    }
-
-    session.checkpoints.push({
-      round: safeInput.round,
-      guessFrequency: safeInput.guess.frequency,
-      clientScore: safeInput.score,
-      serverScore: serverRoundScore,
-      checkedAtMs: nowMs
-    });
-    session.runningRawScore = summary.serverRoundTotal;
-    session.runningScore = summary.serverRoundTotal;
-    session.nextRound = safeInput.round + 1;
-
-    res.status(201).json({
+    res.json({
       ok: true,
-      gameId: session.id,
       round: safeInput.round,
-      acceptedScore: serverRoundScore,
-      runningScore: session.runningScore,
-      errorHz: computed.errorHz,
-      errorPercent: computed.errorPercent,
-      remainingRounds: Math.max(0, session.targets.length - summary.checkpointCount)
+      acceptedScore: result.score,
+      runningScore,
+      errorHz: result.errorHz,
+      errorPercent: result.errorPercent
     });
   } catch (error) {
     sendJsonError(
       res,
       Number(error?.statusCode) || 500,
-      error?.message || 'Failed to checkpoint frequency round.',
-      error?.detail || String(error?.message || error),
-      error?.code || 'FREQUENCY_GAME_CHECKPOINT_ERROR'
+      error?.message || 'Failed to submit round checkpoint.',
+      error?.detail || '',
+      error?.code || 'FREQUENCY_CHECKPOINT_ERROR'
     );
   }
 });
 
-app.post('/api/frequency/game/submit', applyFrequencySubmitRateLimit, async (req, res) => {
-  let safeInput;
-  try {
-    safeInput = validateFrequencyGameSubmitPayload(req.body);
-  } catch (error) {
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency game submit payload.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
-
-  const clientIp = getClientIp(req);
-  const nowMs = Date.now();
-  pruneExpiredFrequencyGameSessions(nowMs);
-
-  let session;
-  try {
-    session = requireActiveFrequencyGameSession({
-      gameId: safeInput.gameId,
-      clientIp,
-      nowMs
-    });
-  } catch (error) {
-    if (error?.code === 'FREQUENCY_GAME_EXPIRED') {
-      activeFrequencyGameSessions.delete(safeInput.gameId);
-    }
-    sendJsonError(
-      res,
-      Number(error?.statusCode) || 400,
-      error?.message || 'Invalid frequency game session.',
-      error?.detail || '',
-      error?.code || null
-    );
-    return;
-  }
+app.post('/api/frequency/game/submit', async (req, res) => {
+  pruneExpiredSessions();
 
   try {
-    const summary = await readFrequencyScoreCheckRoundSummary(session.id);
-    if (summary.checkpointCount !== session.targets.length) {
-      throw createRequestError(
+    const safeInput = normalizeSubmitPayload(req.body);
+    const clientIp = getClientIp(req);
+    const session = getSessionOrThrow(safeInput.gameId, clientIp);
+
+    if (session.results.length !== ROUND_COUNT) {
+      throw createHttpError(
         409,
-        'Game is not complete.',
-        `Expected ${session.targets.length} checkpoint rounds but received ${summary.checkpointCount}.`,
-        'FREQUENCY_GAME_INCOMPLETE'
+        'Cannot submit game before all rounds are validated.',
+        'INCOMPLETE_GAME',
+        `expectedRounds=${ROUND_COUNT} actual=${session.results.length}`
       );
     }
 
-    const serverFinalScore = summary.serverRoundTotal;
-    const submittedAtIso = new Date(nowMs).toISOString();
-    const stagedUiFinalScore = summary.uiRoundTotal;
-
-    await markFrequencyScoreCheckSessionSubmitted(
-      session.id,
-      stagedUiFinalScore,
-      serverFinalScore,
-      submittedAtIso
+    const totalScore = roundTo(
+      session.results.reduce((sum, result) => sum + Number(result.score || 0), 0),
+      2
     );
-
-    if (stagedUiFinalScore !== serverFinalScore) {
-      session.blocked = true;
-      session.blockedReason = `Final score mismatch (staged_ui=${stagedUiFinalScore}, server=${serverFinalScore}).`;
-      await markFrequencyScoreCheckSessionBlocked(session.id, session.blockedReason);
-      throw createRequestError(
-        409,
-        'Final score mismatch detected.',
-        session.blockedReason,
-        'FREQUENCY_SCORE_MISMATCH_FINAL'
-      );
-    }
 
     const saved = await insertFrequencyScore({
       name: safeInput.name,
-      score: serverFinalScore,
+      score: totalScore,
       mode: session.mode,
       difficulty: session.difficulty,
       clientIp,
-      challengeCode: session.challengeCode || ''
+      challengeCode: session.challengeCode
     });
 
-    session.submitted = true;
-    session.submittedAtMs = nowMs;
-    session.score = serverFinalScore;
-    session.runningRawScore = serverFinalScore;
-    session.runningScore = serverFinalScore;
-    await markFrequencyScoreCheckSessionPromoted(session.id, submittedAtIso);
-    const roundRows = await readFrequencyScoreCheckRounds(session.id);
+    session.submittedAt = Date.now();
+    gameSessions.delete(session.gameId);
 
-    res.status(201).json({
-      ...saved,
-      gameId: session.id,
-      startedAt: session.startedAtMs,
-      expiresAt: session.expiresAtMs,
-      submittedAt: nowMs,
-      roundCount: roundRows.length,
-      rounds: roundRows.map((round) => ({
-        round: Number(round.round_no),
-        score: Number(round.server_score),
-        errorHz: Number(round.error_hz),
-        errorPercent: Number(round.error_percent)
-      }))
+    res.json({
+      ok: true,
+      name: saved.name,
+      score: saved.score,
+      rank: saved.rank,
+      mode: saved.mode,
+      difficulty: saved.difficulty,
+      time: saved.time,
+      challengeCode: saved.challengeCode
     });
   } catch (error) {
     sendJsonError(
       res,
       Number(error?.statusCode) || 500,
-      error?.message || 'Failed to submit frequency game result.',
-      error?.detail || String(error?.message || error),
-      error?.code || 'FREQUENCY_GAME_SUBMIT_ERROR'
+      error?.message || 'Failed to submit final frequency score.',
+      error?.detail || '',
+      error?.code || 'FREQUENCY_SUBMIT_ERROR'
     );
   }
 });
 
-app.post('/api/frequency/scores', (_req, res) => {
+app.use(express.static(__dirname, { index: false }));
+
+app.get('/', (req, res) => {
+  res.redirect('/frequency-guess-challenge/');
+});
+
+app.get('/frequency-guess-challenge', (req, res) => {
+  res.redirect('/frequency-guess-challenge/');
+});
+
+app.get('/frequency-guess-challenge/', (req, res) => {
+  res.sendFile(path.join(__dirname, 'frequency-guess-challenge', 'index.html'));
+});
+
+app.use((req, res) => {
+  sendJsonError(res, 404, 'Route not found.', '', 'ROUTE_NOT_FOUND');
+});
+
+app.use((error, req, res, next) => {
+  const statusCode = Number(error?.statusCode) || 500;
   sendJsonError(
     res,
-    410,
-    'Direct frequency score submission is disabled.',
-    'Use POST /api/frequency/game/start and POST /api/frequency/game/submit.',
-    'FREQUENCY_LEGACY_SCORE_ROUTE_DISABLED'
+    statusCode,
+    error?.message || 'Unhandled server error.',
+    error?.detail || '',
+    error?.code || 'UNHANDLED_SERVER_ERROR'
   );
 });
 
-app.post('/api/scores', (_req, res) => {
-  sendJsonError(
-    res,
-    410,
-    'Direct score submission is disabled.',
-    'Use POST /api/game/start and POST /api/game/submit.',
-    'LEGACY_SCORE_ROUTE_DISABLED'
+async function initializeDatabase() {
+  await run(
+    `
+      CREATE TABLE IF NOT EXISTS frequency_scores (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT 'solo',
+        difficulty TEXT NOT NULL DEFAULT 'easy',
+        score REAL NOT NULL,
+        time TEXT NOT NULL,
+        challenge_code TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT ''
+      )
+    `
   );
-});
 
-function startServer() {
-  let attempt = 0;
+  await run(
+    `
+      CREATE TABLE IF NOT EXISTS frequency_daily_challenges (
+        date_key TEXT PRIMARY KEY,
+        easy_freqs_json TEXT NOT NULL,
+        hard_freqs_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      )
+    `
+  );
 
-  const tryListen = () => {
-    const port = INITIAL_PORT + attempt;
+  await run(
+    `
+      CREATE TABLE IF NOT EXISTS frequency_daily_plays (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date_key TEXT NOT NULL,
+        ip TEXT NOT NULL,
+        difficulty TEXT NOT NULL,
+        player_name TEXT NOT NULL,
+        score REAL NOT NULL,
+        played_at TEXT NOT NULL,
+        UNIQUE(date_key, ip, difficulty)
+      )
+    `
+  );
+
+  const dailyPlayColumns = await all(`PRAGMA table_info(frequency_daily_plays)`);
+  const dailyPlayColumnNames = new Set(
+    dailyPlayColumns.map((column) => String(column?.name || '').toLowerCase())
+  );
+
+  if (!dailyPlayColumnNames.has('difficulty')) {
+    await run(`ALTER TABLE frequency_daily_plays ADD COLUMN difficulty TEXT NOT NULL DEFAULT 'easy'`);
+  }
+  if (!dailyPlayColumnNames.has('player_name')) {
+    await run(`ALTER TABLE frequency_daily_plays ADD COLUMN player_name TEXT NOT NULL DEFAULT 'Player'`);
+  }
+  if (!dailyPlayColumnNames.has('played_at')) {
+    await run(`ALTER TABLE frequency_daily_plays ADD COLUMN played_at TEXT NOT NULL DEFAULT ''`);
+  }
+
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_rank ON frequency_scores(score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_mode ON frequency_scores(mode, difficulty, score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_scores_challenge ON frequency_scores(mode, challenge_code, score DESC, time ASC)`);
+  await run(`CREATE INDEX IF NOT EXISTS idx_frequency_daily_plays ON frequency_daily_plays(date_key, ip, difficulty)`);
+
+  await run(`UPDATE frequency_scores SET mode = 'solo' WHERE mode IS NULL OR trim(mode) = ''`);
+  await run(`UPDATE frequency_scores SET difficulty = 'easy' WHERE difficulty IS NULL OR trim(difficulty) = ''`);
+  await run(`UPDATE frequency_scores SET challenge_code = '' WHERE challenge_code IS NULL`);
+  await run(`UPDATE frequency_scores SET time = COALESCE(NULLIF(time, ''), datetime('now'))`);
+  await run(`UPDATE frequency_scores SET created_at = COALESCE(NULLIF(created_at, ''), time, datetime('now'))`);
+  await run(`UPDATE frequency_daily_plays SET difficulty = 'easy' WHERE difficulty IS NULL OR trim(difficulty) = ''`);
+  await run(`UPDATE frequency_daily_plays SET player_name = 'Player' WHERE player_name IS NULL OR trim(player_name) = ''`);
+  await run(`UPDATE frequency_daily_plays SET played_at = COALESCE(NULLIF(played_at, ''), datetime('now'))`);
+}
+
+async function startServer() {
+  await initializeDatabase();
+
+  const listenOnPort = (port, attemptsLeft) => {
     const server = app.listen(port, HOST, () => {
-      activePort = port;
-      if (attempt > 0) {
-        console.warn(`Port ${INITIAL_PORT} was unavailable, using ${port} instead.`);
-      }
-      console.log(`Color Recall server listening on http://${HOST}:${port}`);
-      console.log(`SQLite DB: ${SQLITE_DB_PATH}`);
+      console.log(`[frequency-game] listening on http://${HOST}:${port}`);
+      console.log(`[frequency-game] SQLite: ${SQLITE_DB_PATH}`);
     });
 
     server.on('error', (error) => {
-      const recoverable = !EXPLICIT_PORT
-        && attempt < PORT_SCAN_LIMIT - 1
-        && (error?.code === 'EADDRINUSE' || error?.code === 'EACCES');
-
-      if (recoverable) {
-        attempt += 1;
-        setTimeout(tryListen, 0);
+      if (error && error.code === 'EADDRINUSE' && !EXPLICIT_PORT && attemptsLeft > 0) {
+        const nextPort = port + 1;
+        console.warn(`[frequency-game] port ${port} busy, trying ${nextPort}`);
+        listenOnPort(nextPort, attemptsLeft - 1);
         return;
       }
 
-      console.error(`Failed to start server on http://${HOST}:${port}`);
-      console.error(error?.message || String(error));
-      process.exit(1);
+      console.error('[frequency-game] failed to start server:', error);
+      process.exitCode = 1;
     });
   };
 
-  tryListen();
+  listenOnPort(INITIAL_PORT, PORT_SCAN_LIMIT - 1);
 }
 
-async function bootstrap() {
-  db = await openDatabase(SQLITE_DB_PATH);
-  await ensureSchema();
-  startServer();
-}
-
-bootstrap().catch((error) => {
-  console.error('Failed to initialize SQLite backend.');
-  console.error(error?.message || String(error));
-  process.exit(1);
+startServer().catch((error) => {
+  console.error('[frequency-game] fatal startup error:', error);
+  process.exitCode = 1;
 });
